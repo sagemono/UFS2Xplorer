@@ -2,15 +2,9 @@
 
 A desktop app for reading and managing a PS3 hard drive on your PC.
 
-Take the drive out of your PS3 (or connect it with a USB adapter), open it on your
-computer, and browse it like a file manager. You can copy files in and out, install
-PKG games, updates and DLC straight onto the disk, install their licenses, and back
-up or rebuild the game database. It reads and writes the PS3's encrypted GameOS
-partition (UFS2), so nothing has to be done on the console itself apart from a final
-database rebuild.
+Take the drive out of your PS3, open it on your computer, and browse it like a file manager. You can copy files in and out, install PKG games, updates and DLC straight onto the disk, install their licenses, and back up or rebuild the game database. It reads and writes the PS3's encrypted GameOS partition (UFS2), so nothing has to be done on the console itself apart from a final database rebuild.
 
-There are already good command line readers for PS3 drives. UFS2Xplorer is aimed at
-people who want a proper graphical app that can also write, not just read.
+There are already good command line readers for PS3 drives. UFS2Xplorer is aimed at people who want a proper graphical app that can also write, not just read.
 
 ## What it can do
 
