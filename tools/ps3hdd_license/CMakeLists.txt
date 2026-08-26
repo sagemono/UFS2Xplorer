@@ -1,0 +1,3 @@
+add_executable(ps3hdd_license_tool main.cpp)
+set_target_properties(ps3hdd_license_tool PROPERTIES OUTPUT_NAME ps3hdd_license)
+target_link_libraries(ps3hdd_license_tool PRIVATE ps3hdd_app ps3hdd_fs ps3hdd_cryptodisk ps3hdd_disk ps3hdd_crypto ps3hdd_license)

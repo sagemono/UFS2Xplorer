@@ -1,0 +1,2 @@
+add_executable(ps3hdd_ls main.cpp)
+target_link_libraries(ps3hdd_ls PRIVATE ps3hdd_app ps3hdd_fs ps3hdd_cryptodisk ps3hdd_disk ps3hdd_crypto)

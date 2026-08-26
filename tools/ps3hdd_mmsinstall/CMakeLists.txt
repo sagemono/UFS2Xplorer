@@ -1,0 +1,2 @@
+add_executable(ps3hdd_mmsinstall main.cpp)
+target_link_libraries(ps3hdd_mmsinstall PRIVATE ps3hdd_mms)

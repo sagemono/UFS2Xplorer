@@ -1,0 +1,15 @@
+{
+  "name": "UFS2Xplorer",
+  "version-string": "0.9.0",
+  "description": "Cross platform PS3 HDD tool",
+  "dependencies": [
+    {
+      "name": "qtbase",
+      "default-features": false,
+      "features": [ "gui", "widgets", "png" ]
+    },
+    "openssl",
+    "catch2"
+  ],
+  "builtin-baseline": "ce35b1a53aac26d7fcdb8ee1ef7a8e4eea02d27b"
+}
