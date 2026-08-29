@@ -76,13 +76,20 @@ void ufs2_filesystem::extract_inode(const inode& in, const std::function<void(st
 
         const std::uint64_t offset = partition_offset_ + static_cast<std::uint64_t>(run_start) * sb_.fragment_size;
         const std::uint64_t run_bytes = run_blocks * static_cast<std::uint64_t>(sb_.block_size);
-        const std::size_t to_emit = static_cast<std::size_t>(std::min<std::uint64_t>(run_bytes, file_size - written));
+        const std::uint64_t to_emit = std::min<std::uint64_t>(run_bytes, file_size - written);
 
-        auto data = disk_.read_bytes(offset, static_cast<std::size_t>(run_bytes));
-        sink({data.data(), to_emit});
+
+        constexpr std::uint64_t kChunk = 8u * 1024 * 1024;
+        std::uint64_t done = 0;
+        while (done < to_emit) {
+            const std::size_t piece = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, to_emit - done));
+            auto data = disk_.read_bytes(offset + done, piece);
+            sink({data.data(), data.size()});
+            done += piece;
+            if (progress) progress(written + done);
+        }
         written += to_emit;
         idx += run_blocks;
-        if (progress) progress(written);
     }
 }
 

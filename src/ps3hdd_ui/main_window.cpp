@@ -22,7 +22,7 @@
 #include <QSettings>
 
 #ifndef UFS2XPLORER_VERSION
-#define UFS2XPLORER_VERSION "0.9.0"
+#define UFS2XPLORER_VERSION "0.9.1"
 #endif
 #include <QApplication>
 #include <QCheckBox>
@@ -75,6 +75,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <vector>
 
 #ifdef _WIN32
@@ -1551,6 +1552,13 @@ void main_window::act_extract() {
     if (!idx.isValid() || !fs_) return;
     const std::uint64_t inode = model_->inode_of(idx);
     const QString name = model_->is_root(idx) ? QStringLiteral("root") : model_->name_of(idx);
+    auto extract_file = [this](std::uint64_t ino, const QString& out_path) {
+        QFile f(out_path);
+        if (!f.open(QIODevice::WriteOnly)) throw std::runtime_error("cannot write " + out_path.toStdString());
+        fs_->extract_inode(fs_->read_inode(ino), [&f](std::span<const std::byte> chunk) {
+            f.write(reinterpret_cast<const char*>(chunk.data()), static_cast<qint64>(chunk.size()));
+        });
+    };
     try {
         if (model_->is_dir(idx)) {
             const QString base = QFileDialog::getExistingDirectory(this, QStringLiteral("Extract folder into"));
@@ -1560,24 +1568,17 @@ void main_window::act_extract() {
                 for (const auto& e : fs_->read_directory(fs_->read_inode(din))) {
                     if (e.name == "." || e.name == "..") continue;
                     const QString child = dir + QStringLiteral("/") + QString::fromStdString(e.name);
-                    if (e.type == fs::dirent_type::directory) {
+                    if (e.type == fs::dirent_type::directory)
                         rec(e.inode_number, child);
-                    } else {
-                        const auto data = fs_->read_inode_data(fs_->read_inode(e.inode_number));
-                        QFile f(child);
-                        if (f.open(QIODevice::WriteOnly))
-                            f.write(reinterpret_cast<const char*>(data.data()), static_cast<qint64>(data.size()));
-                    }
+                    else
+                        extract_file(e.inode_number, child);
                 }
             };
             rec(inode, base + QStringLiteral("/") + name);
         } else {
             const QString out = QFileDialog::getSaveFileName(this, QStringLiteral("Extract file"), name);
             if (out.isEmpty()) return;
-            const auto data = fs_->read_inode_data(fs_->read_inode(inode));
-            QFile f(out);
-            if (f.open(QIODevice::WriteOnly))
-                f.write(reinterpret_cast<const char*>(data.data()), static_cast<qint64>(data.size()));
+            extract_file(inode, out);
         }
         log(QStringLiteral("Extracted %1").arg(name));
     } catch (const std::exception& ex) {

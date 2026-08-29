@@ -26,6 +26,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -94,6 +95,18 @@ int count_host_files(const QString& path) {
     return n;
 }
 
+void stream_write(fs::ufs2_writer& writer, std::uint64_t dst_dir, const std::string& name, QFile& f) {
+    writer.write_file(dst_dir, name, static_cast<std::int64_t>(f.size()), [&f](std::span<std::byte> dst) {
+        qint64 got = 0;
+        const qint64 want = static_cast<qint64>(dst.size());
+        while (got < want) {
+            const qint64 n = f.read(reinterpret_cast<char*>(dst.data()) + got, want - got);
+            if (n <= 0) break;
+            got += n;
+        }
+    });
+}
+
 void import_contents(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QString& host_dir, std::uint64_t dst_dir, const std::function<void()>& on_file, int depth = 0) {
     if (depth > 128) throw std::runtime_error("import aborted: directory nesting too deep");
     std::map<std::string, std::pair<std::uint64_t, bool>> existing; // name -> (inode, is_dir)
@@ -117,8 +130,7 @@ void import_contents(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QS
             if (existing.count(name)) writer.delete_tree(dst_dir, name);
             QFile f(child.absoluteFilePath());
             if (!f.open(QIODevice::ReadOnly)) continue;
-            const QByteArray bytes = f.readAll();
-            writer.write_file(dst_dir, name, {reinterpret_cast<const std::byte*>(bytes.constData()), static_cast<std::size_t>(bytes.size())});
+            stream_write(writer, dst_dir, name, f);
             if (on_file) on_file();
         }
     }
@@ -139,8 +151,7 @@ void import_path(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QStrin
             if (e.name == name) { writer.delete_tree(dst_dir, name); break; }
         QFile f(host_path);
         if (!f.open(QIODevice::ReadOnly)) throw std::runtime_error("cannot read " + host_path.toStdString());
-        const QByteArray bytes = f.readAll();
-        writer.write_file(dst_dir, name, {reinterpret_cast<const std::byte*>(bytes.constData()), static_cast<std::size_t>(bytes.size())});
+        stream_write(writer, dst_dir, name, f);
         if (on_file) on_file();
     }
 }
