@@ -95,8 +95,17 @@ int count_host_files(const QString& path) {
     return n;
 }
 
-void stream_write(fs::ufs2_writer& writer, std::uint64_t dst_dir, const std::string& name, QFile& f) {
-    writer.write_file(dst_dir, name, static_cast<std::int64_t>(f.size()), [&f](std::span<std::byte> dst) {
+qint64 count_host_bytes(const QString& path) {
+    QFileInfo fi(path);
+    if (!fi.isDir()) return fi.size();
+    qint64 n = 0;
+    for (const QFileInfo& c : QDir(path).entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries | QDir::Hidden))
+        n += count_host_bytes(c.absoluteFilePath());
+    return n;
+}
+
+void stream_write(fs::ufs2_writer& writer, std::uint64_t dst_dir, const std::string& name, QFile& f, const std::function<void(qint64)>& on_bytes) {
+    writer.write_file(dst_dir, name, static_cast<std::int64_t>(f.size()), [&](std::span<std::byte> dst) {
         qint64 got = 0;
         const qint64 want = static_cast<qint64>(dst.size());
         while (got < want) {
@@ -104,10 +113,11 @@ void stream_write(fs::ufs2_writer& writer, std::uint64_t dst_dir, const std::str
             if (n <= 0) break;
             got += n;
         }
+        if (on_bytes) on_bytes(got);
     });
 }
 
-void import_contents(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QString& host_dir, std::uint64_t dst_dir, const std::function<void()>& on_file, int depth = 0) {
+void import_contents(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QString& host_dir, std::uint64_t dst_dir, const std::function<void(qint64)>& on_bytes, int depth = 0) {
     if (depth > 128) throw std::runtime_error("import aborted: directory nesting too deep");
     std::map<std::string, std::pair<std::uint64_t, bool>> existing; // name -> (inode, is_dir)
     for (const auto& e : ufs.read_directory(ufs.read_inode(dst_dir)))
@@ -125,18 +135,17 @@ void import_contents(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QS
                 if (it != existing.end()) writer.delete_tree(dst_dir, name);
                 sub = writer.create_directory(dst_dir, name);
             }
-            import_contents(ufs, writer, child.absoluteFilePath(), sub, on_file, depth + 1);
+            import_contents(ufs, writer, child.absoluteFilePath(), sub, on_bytes, depth + 1);
         } else {
             if (existing.count(name)) writer.delete_tree(dst_dir, name);
             QFile f(child.absoluteFilePath());
             if (!f.open(QIODevice::ReadOnly)) continue;
-            stream_write(writer, dst_dir, name, f);
-            if (on_file) on_file();
+            stream_write(writer, dst_dir, name, f, on_bytes);
         }
     }
 }
 
-void import_path(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QString& host_path, std::uint64_t dst_dir, const std::function<void()>& on_file) {
+void import_path(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QString& host_path, std::uint64_t dst_dir, const std::function<void(qint64)>& on_bytes) {
     QFileInfo fi(host_path);
     const std::string name = fi.fileName().toStdString();
     if (fi.isDir()) {
@@ -145,14 +154,13 @@ void import_path(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QStrin
         for (const auto& e : ufs.read_directory(ufs.read_inode(dst_dir)))
             if (e.name == name && e.type == fs::dirent_type::directory) { sub = e.inode_number; found = true; break; }
         if (!found) sub = writer.create_directory(dst_dir, name);
-        import_contents(ufs, writer, host_path, sub, on_file);
+        import_contents(ufs, writer, host_path, sub, on_bytes);
     } else {
         for (const auto& e : ufs.read_directory(ufs.read_inode(dst_dir)))
             if (e.name == name) { writer.delete_tree(dst_dir, name); break; }
         QFile f(host_path);
         if (!f.open(QIODevice::ReadOnly)) throw std::runtime_error("cannot read " + host_path.toStdString());
-        stream_write(writer, dst_dir, name, f);
-        if (on_file) on_file();
+        stream_write(writer, dst_dir, name, f, on_bytes);
     }
 }
 
@@ -363,16 +371,19 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
     }
     case job::fop_import: {
         emit progress(QStringLiteral("Scanning ..."), -1);
-        int total_files = 0;
-        for (const QString& p : job_.fop_import_paths) total_files += count_host_files(p);
-        int files = 0;
+        qint64 total_bytes = 0;
+        for (const QString& p : job_.fop_import_paths) total_bytes += count_host_bytes(p);
+        qint64 bytes_done = 0;
+        int last_pct = -1;
         for (const QString& path : job_.fop_import_paths) {
             if (cancel_.load()) break;
-            emit progress(QStringLiteral("Importing %1 (%2 files) ...").arg(QFileInfo(path).fileName()).arg(total_files), total_files > 0 ? 100 * files / total_files : -1);
+            emit progress(QStringLiteral("Importing %1 ...").arg(QFileInfo(path).fileName()),
+                          total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : -1);
             try {
-                import_path(ufs, writer, path, job_.fop_dest, [&] {
-                    ++files;
-                    emit progress({}, total_files > 0 ? 100 * files / total_files : 100);
+                import_path(ufs, writer, path, job_.fop_dest, [&](qint64 n) {
+                    bytes_done += n;
+                    const int pct = total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : 100;
+                    if (pct != last_pct) { last_pct = pct; emit progress({}, pct); }
                 });
                 ++done;
             } catch (const std::exception&) {

@@ -22,7 +22,7 @@
 #include <QSettings>
 
 #ifndef UFS2XPLORER_VERSION
-#define UFS2XPLORER_VERSION "0.9.2"
+#define UFS2XPLORER_VERSION "0.9.3"
 #endif
 #include <QApplication>
 #include <QCheckBox>
@@ -275,8 +275,8 @@ void main_window::build_disk_row(QVBoxLayout* root, QPushButton*& refresh, QPush
 void main_window::build_action_row(QVBoxLayout* root) {
     // action row + progress
     auto* actions = new QHBoxLayout();
-    install_btn_ = new QPushButton(QStringLiteral("Install PKG..."));
-    license_btn_ = new QPushButton(QStringLiteral("Install License..."));
+    install_btn_ = new QPushButton(QStringLiteral("Install PKG"));
+    license_btn_ = new QPushButton(QStringLiteral("Install License"));
     fsck_btn_ = new QPushButton(QStringLiteral("Check Consistency"));
     repair_btn_ = new QPushButton(QStringLiteral("Repair Free Counts"));
     repair_btn_->setToolTip(QStringLiteral("Recompute each cylinder group's free-space counts from the bitmaps to fix summary-mismatches left by an interrupted write."));
