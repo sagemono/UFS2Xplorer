@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace ps3hdd::fs {
 
@@ -874,47 +876,54 @@ void ufs2_writer::free_inode_blocks(const inode& in) {
     const std::int64_t nblocks = (in.size + sb_.block_size - 1) / sb_.block_size;
     const bool needs_indirect = nblocks > 12;
 
-    auto read_block = [&](std::int64_t abs) {
-        return disk_.read_bytes(fs_.partition_offset_bytes() + static_cast<std::uint64_t>(abs) * sb_.fragment_size, static_cast<std::size_t>(sb_.block_size));
+    //hardening
+    auto frag_ok = [&](std::int64_t f) {
+        return f > 0 && (sb_.total_fragments <= 0 || f + fpb <= sb_.total_fragments);
+    };
+    auto free_ptr = [&](std::int64_t f) { if (frag_ok(f)) free_block_run(f, fpb); };
+    auto try_read = [&](std::int64_t abs) -> std::optional<std::vector<std::byte>> {
+        if (!frag_ok(abs)) return std::nullopt;
+        try {
+            return disk_.read_bytes(fs_.partition_offset_bytes() + static_cast<std::uint64_t>(abs) * sb_.fragment_size, static_cast<std::size_t>(sb_.block_size));
+        } catch (...) {
+            return std::nullopt;
+        }
     };
 
     // direct data blocks
     for (std::int64_t b = 0; b < 12 && b < nblocks; ++b) {
-        if (in.direct_blocks[static_cast<std::size_t>(b)] == 0) break;
+        const std::int64_t d = in.direct_blocks[static_cast<std::size_t>(b)];
+        if (d == 0) break;
         int frags_this = fpb;
         if (b == nblocks - 1 && !needs_indirect) {
             const std::int64_t tail = in.size - b * sb_.block_size;
             frags_this = static_cast<int>((tail + sb_.fragment_size - 1) / sb_.fragment_size);
             frags_this = std::max(1, std::min(frags_this, fpb));
         }
-        free_block_run(in.direct_blocks[static_cast<std::size_t>(b)], frags_this);
+        if (frag_ok(d)) free_block_run(d, frags_this);
     }
 
     // single indirect
     // free the data blocks it points to, then the block itself
     if (in.indirect_block != 0) {
-        auto blk = read_block(in.indirect_block);
-        for (std::int64_t j = 0; j < ppb; ++j) {
-            const std::int64_t p = static_cast<std::int64_t>(ps3hdd::read_be_u64(blk.data() + j * 8));
-            if (p != 0) free_block_run(p, fpb);
-        }
-        free_block_run(in.indirect_block, fpb);
+        if (auto blk = try_read(in.indirect_block))
+            for (std::int64_t j = 0; j < ppb; ++j)
+                free_ptr(static_cast<std::int64_t>(ps3hdd::read_be_u64(blk->data() + j * 8)));
+        free_ptr(in.indirect_block);
     }
 
     // Double indirect.
     if (in.double_indirect_block != 0) {
-        auto dbl = read_block(in.double_indirect_block);
-        for (std::int64_t l1 = 0; l1 < ppb; ++l1) {
-            const std::int64_t l1p = static_cast<std::int64_t>(ps3hdd::read_be_u64(dbl.data() + l1 * 8));
-            if (l1p == 0) continue;
-            auto l1blk = read_block(l1p);
-            for (std::int64_t j = 0; j < ppb; ++j) {
-                const std::int64_t p = static_cast<std::int64_t>(ps3hdd::read_be_u64(l1blk.data() + j * 8));
-                if (p != 0) free_block_run(p, fpb);
+        if (auto dbl = try_read(in.double_indirect_block))
+            for (std::int64_t l1 = 0; l1 < ppb; ++l1) {
+                const std::int64_t l1p = static_cast<std::int64_t>(ps3hdd::read_be_u64(dbl->data() + l1 * 8));
+                if (l1p == 0) continue;
+                if (auto l1blk = try_read(l1p))
+                    for (std::int64_t j = 0; j < ppb; ++j)
+                        free_ptr(static_cast<std::int64_t>(ps3hdd::read_be_u64(l1blk->data() + j * 8)));
+                free_ptr(l1p);
             }
-            free_block_run(l1p, fpb);
-        }
-        free_block_run(in.double_indirect_block, fpb);
+        free_ptr(in.double_indirect_block);
     }
 }
 

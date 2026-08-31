@@ -17,6 +17,9 @@ bool ufs2_filesystem::mount() {
 
 inode ufs2_filesystem::read_inode(std::uint64_t inode_number) {
     if (!sb_.valid()) throw std::runtime_error("Filesystem not mounted.");
+    const std::uint64_t total_inodes = static_cast<std::uint64_t>(sb_.cylinder_groups) * static_cast<std::uint64_t>(sb_.inodes_per_group);
+    if (sb_.inodes_per_group <= 0 || inode_number >= total_inodes)
+        throw std::runtime_error("read_inode: inode number out of range");
 
     const std::int64_t group = static_cast<std::int64_t>(inode_number) / sb_.inodes_per_group;
     const std::int64_t index = static_cast<std::int64_t>(inode_number) % sb_.inodes_per_group;
@@ -30,6 +33,9 @@ inode ufs2_filesystem::read_inode(std::uint64_t inode_number) {
 }
 
 std::vector<std::byte> ufs2_filesystem::read_block(std::int64_t fragment_address) {
+    const std::int64_t fpb = sb_.fragment_size > 0 ? sb_.block_size / sb_.fragment_size : 0;
+    if (fragment_address <= 0 || fpb <= 0 || (sb_.total_fragments > 0 && fragment_address + fpb > sb_.total_fragments))
+        throw std::runtime_error("read_block: fragment address out of range");
     const std::uint64_t offset = partition_offset_ + static_cast<std::uint64_t>(fragment_address) * sb_.fragment_size;
     if (offset + static_cast<std::uint64_t>(sb_.block_size) > disk_.total_size())
         throw std::runtime_error("read_block: address out of disk bounds");
