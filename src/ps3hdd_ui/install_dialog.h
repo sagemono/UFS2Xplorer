@@ -43,10 +43,14 @@ public:
     bool installed_ok() const { return installed_ok_; }
     bool wrote() const { return wrote_; }
 
+signals:
+    void speed(double bytes_per_sec);
+
 private slots:
     void start_install();
     void request_cancel();
     void on_progress(const QString& line, int percent);
+    void on_speed(double bytes_per_sec);
     void on_finished(bool ok, const QString& summary);
 
 private:

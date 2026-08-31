@@ -19,8 +19,12 @@ class pkg_installer {
 public:
     pkg_installer(fs::ufs2_filesystem& filesystem, fs::ufs2_writer& writer, const ps3_pkg_reader& pkg);
 
+    using file_progress = std::function<void(const std::string& name, int index, int count)>;
+    using byte_progress = std::function<void(std::int64_t bytes)>;
+
     std::string title_id() const { return pkg_.title_id(); }
-    std::string install(const std::function<void(const std::string&, int, int)>& progress = {});
+    std::uint64_t total_bytes() const;
+    std::string install(const file_progress& progress = {}, const byte_progress& on_written = {});
 
 private:
     struct dir_node {
@@ -35,7 +39,7 @@ private:
     dir_node build_tree() const;
     std::int64_t resolve_child(std::uint64_t parent, const std::string& name) const;
     std::uint64_t ensure_directory(std::uint64_t parent, const std::string& name);
-    void install_node(const dir_node& node, std::uint64_t dir_inode, int total, int& done, const std::function<void(const std::string&, int, int)>& progress);
+    void install_node(const dir_node& node, std::uint64_t dir_inode, int total, int& done, const file_progress& progress, const byte_progress& on_written);
 };
 
 } // namespace ps3hdd::pkg

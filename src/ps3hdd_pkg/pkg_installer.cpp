@@ -49,26 +49,34 @@ std::uint64_t pkg_installer::ensure_directory(std::uint64_t parent, const std::s
     return writer_.create_directory(parent, name);
 }
 
-void pkg_installer::install_node(const dir_node& node, std::uint64_t dir_inode, int total, int& done, const std::function<void(const std::string&, int, int)>& progress) {
+void pkg_installer::install_node(const dir_node& node, std::uint64_t dir_inode, int total, int& done, const file_progress& progress, const byte_progress& on_written) {
     for (const auto& [name, entry] : node.files) {
         if (progress) progress(name, done + 1, total);
         const bool exists = resolve_child(dir_inode, name) >= 0;
         if (exists && !entry->overwrite) {
+            if (on_written) on_written(static_cast<std::int64_t>(entry->data_size));
             ++done;
             continue;
         }
         if (exists) writer_.delete_tree(dir_inode, name);
         std::uint64_t entry_off = 0;
-        writer_.write_file(dir_inode, name, static_cast<std::int64_t>(entry->data_size), [&](std::span<std::byte> dst) {pkg_.decrypt_range(*entry, entry_off, dst);entry_off += dst.size();});
+        writer_.write_file(dir_inode, name, static_cast<std::int64_t>(entry->data_size), [&](std::span<std::byte> dst) {pkg_.decrypt_range(*entry, entry_off, dst);entry_off += dst.size();}, on_written);
         ++done;
     }
     for (const auto& [name, child] : node.dirs) {
         const std::uint64_t child_inode = ensure_directory(dir_inode, name);
-        install_node(child, child_inode, total, done, progress);
+        install_node(child, child_inode, total, done, progress, on_written);
     }
 }
 
-std::string pkg_installer::install(const std::function<void(const std::string&, int, int)>& progress) {
+std::uint64_t pkg_installer::total_bytes() const {
+    std::uint64_t sum = 0;
+    for (const auto& e : pkg_.entries())
+        if (!e.is_directory) sum += e.data_size;
+    return sum;
+}
+
+std::string pkg_installer::install(const file_progress& progress, const byte_progress& on_written) {
     const std::string tid = pkg_.title_id();
     if (tid.empty())
         throw std::runtime_error("could not determine TITLE_ID from the package");
@@ -82,7 +90,7 @@ std::string pkg_installer::install(const std::function<void(const std::string&, 
         if (!e.is_directory) ++total;
 
     int done = 0;
-    install_node(root, title, total, done, progress);
+    install_node(root, title, total, done, progress, on_written);
 
     writer_.update_superblock();
     return "game/" + tid;

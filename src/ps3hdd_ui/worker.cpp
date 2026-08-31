@@ -357,29 +357,53 @@ void worker::run_verify_pkg() {
     }
 }
 
+class worker::xfer_meter {
+public:
+    explicit xfer_meter(worker& w) : w_(w) { clock_.start(); }
+
+    qint64 total = 0;
+
+    int pct() const { return total > 0 ? static_cast<int>(100 * done_ / total) : -1; }
+
+    void add(qint64 n) {
+        done_ += n;
+        const int pct = total > 0 ? static_cast<int>(100 * done_ / total) : 100;
+        const qint64 now = clock_.elapsed();
+        if (pct == last_pct_ && now - last_ms_ < 400) return;
+        const double bps = now > last_ms_ ? (done_ - last_bytes_) * 1000.0 / (now - last_ms_) : 0.0;
+        if (bps > peak_) peak_ = bps;
+        last_pct_ = pct;
+        last_bytes_ = done_;
+        last_ms_ = now;
+        emit w_.progress({}, pct);
+        emit w_.speed(bps);
+    }
+
+    QString summary() const {
+        if (done_ <= 0) return {};
+        const qint64 ms = clock_.elapsed();
+        const double avg = ms > 0 ? done_ * 1000.0 / ms : 0.0;
+        const double secs = ms / 1000.0;
+        const QString dur = secs < 60 ? QStringLiteral("%1 s").arg(secs, 0, 'f', 1) : QStringLiteral("%1m %2s").arg(static_cast<int>(secs) / 60).arg(static_cast<int>(secs) % 60);
+        auto sz = [](double b) { return QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(b))); };
+        return QStringLiteral("  |  %1 in %2 (avg %3/s, peak %4/s)").arg(sz(static_cast<double>(done_)), dur, sz(avg), sz(peak_));
+    }
+
+private:
+    worker& w_;
+    QElapsedTimer clock_;
+    qint64 done_ = 0, last_bytes_ = 0, last_ms_ = 0;
+    int last_pct_ = -1;
+    double peak_ = 0.0;
+};
+
 void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     fs::ufs2_writer writer(ufs, *m.decrypted);
     int done = 0, skipped = 0;
 
-    QElapsedTimer clock;
-    clock.start();
-    qint64 total = 0, bytes_done = 0, last_bytes = 0, last_ms = 0;
-    int last_pct = -1;
-    double peak_bps = 0.0;
-    auto report = [&](qint64 n) {
-        bytes_done += n;
-        const int pct = total > 0 ? static_cast<int>(100 * bytes_done / total) : 100;
-        const qint64 now = clock.elapsed();
-        if (pct != last_pct || now - last_ms >= 400) {
-            const double bps = now > last_ms ? (bytes_done - last_bytes) * 1000.0 / (now - last_ms) : 0.0;
-            if (bps > peak_bps) peak_bps = bps;
-            last_pct = pct;
-            last_bytes = bytes_done;
-            last_ms = now;
-            emit progress({}, pct);
-            emit speed(bps);
-        }
-    };
+    xfer_meter meter(*this);
+    qint64& total = meter.total;
+    auto report = [&](qint64 n) { meter.add(n); };
 
     switch (job_.file_operation) {
     case job::fop_delete: {
@@ -415,8 +439,7 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
         for (const auto& it : job_.fop_items) total += count_bytes(ufs, it.inode, it.is_dir);
         for (const auto& it : job_.fop_items) {
             if (cancel_.load()) break;
-            emit progress(QStringLiteral("Copying %1 ...").arg(it.name),
-                          total > 0 ? static_cast<int>(100 * bytes_done / total) : -1);
+            emit progress(QStringLiteral("Copying %1 ...").arg(it.name), meter.pct());
             copy_tree(ufs, writer, it.inode, it.is_dir, unique_child_name(ufs, job_.fop_dest, it.name.toStdString()), job_.fop_dest, report);
             ++done;
         }
@@ -427,8 +450,7 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
         for (const QString& p : job_.fop_import_paths) total += count_host_bytes(p);
         for (const QString& path : job_.fop_import_paths) {
             if (cancel_.load()) break;
-            emit progress(QStringLiteral("Importing %1 ...").arg(QFileInfo(path).fileName()),
-                          total > 0 ? static_cast<int>(100 * bytes_done / total) : -1);
+            emit progress(QStringLiteral("Importing %1 ...").arg(QFileInfo(path).fileName()), meter.pct());
             try {
                 import_path(ufs, writer, path, job_.fop_dest, report);
                 ++done;
@@ -443,8 +465,7 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
         for (const auto& it : job_.fop_items) total += count_bytes(ufs, it.inode, it.is_dir);
         for (const auto& it : job_.fop_items) {
             if (cancel_.load()) break;
-            emit progress(QStringLiteral("Extracting %1 ...").arg(it.name),
-                          total > 0 ? static_cast<int>(100 * bytes_done / total) : -1);
+            emit progress(QStringLiteral("Extracting %1 ...").arg(it.name), meter.pct());
             const QString dest =
                 it.is_dir ? job_.fop_host_dest + QStringLiteral("/") + it.name : job_.fop_host_dest;
             extract_tree(ufs, it.inode, it.is_dir, dest, report);
@@ -455,6 +476,7 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
     default:
         break;
     }
+    emit speed(0.0);
     emit progress(QStringLiteral("Updating free-space summary ..."), -1);
     writer.update_superblock();
     QString extra;
@@ -466,15 +488,7 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
         }
     }
 
-    QString xfer;
-    if (bytes_done > 0) {
-        const qint64 ms = clock.elapsed();
-        const double avg = ms > 0 ? bytes_done * 1000.0 / ms : 0.0;
-        const double secs = ms / 1000.0;
-        const QString dur = secs < 60 ? QStringLiteral("%1 s").arg(secs, 0, 'f', 1) : QStringLiteral("%1m %2s").arg(static_cast<int>(secs) / 60).arg(static_cast<int>(secs) % 60);
-        auto sz = [](double b) { return QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(b))); };
-        xfer = QStringLiteral("  |  %1 in %2 (avg %3/s, peak %4/s)").arg(sz(static_cast<double>(bytes_done)), dur, sz(avg), sz(peak_bps));
-    }
+    const QString xfer = meter.summary();
     const bool cancelled = cancel_.load();
     QString msg = QStringLiteral("%1 %2 item(s)%3%4%5").arg(cancelled ? QStringLiteral("Cancelled after") : QStringLiteral("Done:")).arg(done).arg(skipped ? QStringLiteral(" (%1 skipped)").arg(skipped) : QString()).arg(xfer).arg(extra);
     emit finished(true, msg);
@@ -552,11 +566,17 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     emit progress(QStringLiteral("Installing %1 (%2) ...").arg(QString::fromStdString(pkg.content_id()), QString::fromStdString(pkg.title_id())), 0);
     fs::ufs2_writer writer(ufs, *m.decrypted);
     pkg::pkg_installer installer(ufs, writer, pkg);
-    const std::string path = installer.install([&](const std::string& name, int done, int total) {
-        if (cancel_.load()) throw std::runtime_error("cancelled");
-        const QString line = total > 0 ? QStringLiteral("[%1/%2] %3").arg(done).arg(total).arg(QString::fromStdString(name)) : QString::fromStdString(name);
-        emit progress(line, total > 0 ? done * 100 / total : -1);
-    });
+    xfer_meter meter(*this);
+    meter.total = static_cast<qint64>(installer.total_bytes());
+    const std::string path = installer.install(
+        [&](const std::string& name, int done, int total) {
+            if (cancel_.load()) throw std::runtime_error("cancelled");
+            const QString line = total > 0 ? QStringLiteral("[%1/%2] %3").arg(done).arg(total).arg(QString::fromStdString(name)) : QString::fromStdString(name);
+            emit progress(line, meter.pct());
+        },
+        [&](std::int64_t n) { meter.add(n); });
+    emit speed(0.0);
+    const QString xfer = meter.summary();
     if (job_.rebuild_db) {
         QString dbmsg;
         invalidate_db(ufs, writer, dbmsg);
@@ -565,7 +585,7 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     }
 
     if (job_.skip_consistency) {
-        emit finished(true, QStringLiteral("Installed to %1.  (batch: verification deferred)").arg(QString::fromStdString(path)));
+        emit finished(true, QStringLiteral("Installed to %1.  (batch: verification deferred)%2").arg(QString::fromStdString(path), xfer));
         return;
     }
 
@@ -588,8 +608,7 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
         return;
     }
     const QString tail = job_.rebuild_db ? QStringLiteral("  Rebuild flag set (mms/db.err) - just reboot; no safe mode needed.") : QStringLiteral("  On the console: Safe Mode -> Rebuild Database to list the game.");
-    emit finished(true, QStringLiteral("Installed to %1. %2%3").arg(QString::fromStdString(path), msg, tail));
-    return;
+    emit finished(true, QStringLiteral("Installed to %1. %2%3%4").arg(QString::fromStdString(path), msg, tail, xfer));
 }
 
 void worker::run_license_batch(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {

@@ -103,6 +103,7 @@ private:
     void install_licenses_batch(const QStringList& raps);
     QString backup_db_to_temp();
     void set_busy(bool busy);
+    void set_speed(double bytes_per_sec);
     void remount(); 
     bool require_writer();
     void update_capacity();

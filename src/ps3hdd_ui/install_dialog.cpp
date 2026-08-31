@@ -343,8 +343,13 @@ void install_dialog::run_current() {
     worker_->moveToThread(thread_);
     connect(thread_, &QThread::started, worker_, &worker::run);
     connect(worker_, &worker::progress, this, &install_dialog::on_progress);
+    connect(worker_, &worker::speed, this, &install_dialog::on_speed);
     connect(worker_, &worker::finished, this, &install_dialog::on_finished);
     thread_->start();
+}
+
+void install_dialog::on_speed(double bps) {
+    emit speed(bps);
 }
 
 void install_dialog::on_progress(const QString& line, int percent) {
@@ -361,6 +366,7 @@ void install_dialog::on_progress(const QString& line, int percent) {
 }
 
 void install_dialog::on_finished(bool ok, const QString& summary) {
+    on_speed(0.0);
     thread_->quit();
     thread_->wait();
     worker_->deleteLater();

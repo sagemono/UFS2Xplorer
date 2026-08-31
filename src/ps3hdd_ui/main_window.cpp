@@ -857,6 +857,11 @@ QString main_window::current_device_path() const {
     return device_combo_->currentData().isValid() ? device_combo_->currentData().toString() : device_combo_->currentText();
 }
 
+void main_window::set_speed(double bps) {
+    if (!speed_label_) return;
+    speed_label_->setText(bps > 0 ? QStringLiteral("%1/s").arg(QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(bps)))) : QString());
+}
+
 void main_window::set_busy(bool busy) {
     set_disk_actions_enabled(!busy);
     if (eject_btn_) eject_btn_->setEnabled(!busy);
@@ -888,9 +893,7 @@ void main_window::start_job(job j, const QString& title) {
         else progress_->setRange(0, 0);
         if (!line.isEmpty()) log(line);
     });
-    connect(w, &worker::speed, this, [this](double bps) {
-        speed_label_->setText(bps > 0 ? QStringLiteral("%1/s").arg(QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(bps)))) : QString());
-    });
+    connect(w, &worker::speed, this, &main_window::set_speed);
     connect(w, &worker::finished, this,
             [this, w, was_write, is_fileop, is_pkg_install](bool ok, const QString& summary) {
         log(summary);
@@ -938,7 +941,9 @@ void main_window::start_pkg_batch(const QStringList& pkgs, const QStringList& ra
     const QString db_backup = backup_db_to_temp();
 
     install_dialog dlg(pkgs, base.device, base.eid, base.broker_port, base.broker_token, this);
+    connect(&dlg, &install_dialog::speed, this, &main_window::set_speed);
     dlg.exec();
+    set_speed(0.0);
     remount();
     if (model_) {
         model_->refresh(model_->root_index());

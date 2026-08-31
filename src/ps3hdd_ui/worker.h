@@ -67,6 +67,8 @@ signals:
     void speed(double bytes_per_sec);
 
 private:
+    class xfer_meter;
+
     void run_verify_pkg();
     void run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
     void run_consistency(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
