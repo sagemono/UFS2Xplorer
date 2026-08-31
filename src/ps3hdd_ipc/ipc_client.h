@@ -34,6 +34,7 @@ public:
 
     std::vector<std::byte> read(std::uint64_t offset, std::uint64_t count);
     void write(std::uint64_t offset, std::span<const std::byte> data);
+    void flush();
 
     struct eject_result {
         bool removed = false;
@@ -46,9 +47,12 @@ public:
 
 private:
     QByteArray request(const QByteArray& payload);
+    void drain_one();
 
     std::unique_ptr<QTcpSocket> sock_;
     static constexpr int kIoTimeoutMs = 60000;
+    int outstanding_ = 0;
+    static constexpr int kMaxOutstanding = 8;
 };
 
 class ipc_disk_source : public disk::disk_source {
@@ -64,6 +68,7 @@ public:
     std::vector<std::byte> read_bytes(std::uint64_t offset, std::size_t count) override;
     void write_sectors(std::uint64_t start_sector, std::span<const std::byte> data) override;
     void write_bytes(std::uint64_t offset, std::span<const std::byte> data) override;
+    void flush() override;
 
 private:
     broker_client& client_;

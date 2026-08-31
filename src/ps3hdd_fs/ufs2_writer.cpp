@@ -615,7 +615,7 @@ std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::str
     });
 }
 
-std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::string& name, std::int64_t size, const std::function<void(std::span<std::byte>)>& fill) {
+std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::string& name, std::int64_t size, const std::function<void(std::span<std::byte>)>& fill, const std::function<void(std::int64_t)>& on_written) {
     if (directory_contains_entry(parent_inode, name))
         throw std::runtime_error("directory already contains the entry");
 
@@ -637,6 +637,20 @@ std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::str
     std::vector<std::int64_t> data_blocks;
     data_blocks.reserve(static_cast<std::size_t>(blocks_needed));
     std::int64_t remaining = size;
+
+    constexpr std::size_t kWriteBatch = 8u * 1024 * 1024;
+    std::vector<std::byte> batch;
+    batch.reserve(kWriteBatch + static_cast<std::size_t>(sb_.block_size));
+    std::int64_t batch_frag = -1; // first frag of the pending batch
+    std::int64_t batch_end = -1;  // frag the batch expects next (for contiguity...)
+    auto flush_batch = [&]() {
+        if (batch.empty()) return;
+        write_data_block(batch_frag, batch);
+        if (on_written) on_written(static_cast<std::int64_t>(batch.size())); // report @ real disk write
+        batch.clear();
+        batch_frag = -1;
+    };
+
     for (std::int64_t b = 0; b < blocks_needed; ++b) {
         const bool is_last = b == blocks_needed - 1;
         int frags_this = fpb;
@@ -646,15 +660,21 @@ std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::str
         }
         const std::int64_t abs_frag = alloc_run(frags_this, block_cg);
 
-        const std::size_t write_bytes = static_cast<std::size_t>(frags_this) * sb_.fragment_size;
-        std::vector<std::byte> buf(write_bytes, std::byte{0});
-        const std::size_t to_copy = static_cast<std::size_t>(std::min<std::int64_t>(write_bytes, remaining));
-        fill({buf.data(), to_copy});
-        write_data_block(abs_frag, buf);
+        const std::size_t wb = static_cast<std::size_t>(frags_this) * sb_.fragment_size;
+        if (batch_frag >= 0 && (abs_frag != batch_end || batch.size() + wb > kWriteBatch))
+            flush_batch();
+        if (batch_frag < 0) batch_frag = abs_frag;
+
+        const std::size_t base = batch.size();
+        batch.resize(base + wb, std::byte{0});
+        const std::size_t to_copy = static_cast<std::size_t>(std::min<std::int64_t>(wb, remaining));
+        fill({batch.data() + base, to_copy});
+        batch_end = abs_frag + frags_this;
 
         data_blocks.push_back(abs_frag);
         remaining -= to_copy;
     }
+    flush_batch();
 
     std::array<std::int64_t, 12> direct{};
     for (std::int64_t i = 0; i < 12 && i < blocks_needed; ++i)
@@ -752,6 +772,7 @@ void ufs2_writer::update_superblock() {
 
     if (cs_off != 0 && !cs_data.empty())
         patch_bytes(cs_off, {cs_data.data(), cs_data.size()}); // rmw for sector alignment
+    disk_.flush();
 }
 
 int ufs2_writer::repair_free_counts(const std::function<void(int, int)>& progress) {

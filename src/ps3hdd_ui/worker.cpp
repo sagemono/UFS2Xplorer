@@ -94,11 +94,13 @@ void copy_tree(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, std::uint64_t 
         const auto src_in = ufs.read_inode(src_inode);
         const auto blocks = ufs.block_pointers(src_in);
         std::uint64_t pos = 0;
-        writer.write_file(dst_dir, name, src_in.size, [&](std::span<std::byte> dst) {
-            ufs.read_range(blocks, pos, dst);
-            pos += dst.size();
-            if (on_bytes) on_bytes(static_cast<qint64>(dst.size()));
-        });
+        writer.write_file(
+            dst_dir, name, src_in.size,
+            [&](std::span<std::byte> dst) {
+                ufs.read_range(blocks, pos, dst);
+                pos += dst.size();
+            },
+            on_bytes); // report @ disk write, not source read!
     }
 }
 
@@ -139,16 +141,18 @@ qint64 count_host_bytes(const QString& path) {
 }
 
 void stream_write(fs::ufs2_writer& writer, std::uint64_t dst_dir, const std::string& name, QFile& f, const std::function<void(qint64)>& on_bytes) {
-    writer.write_file(dst_dir, name, static_cast<std::int64_t>(f.size()), [&](std::span<std::byte> dst) {
-        qint64 got = 0;
-        const qint64 want = static_cast<qint64>(dst.size());
-        while (got < want) {
-            const qint64 n = f.read(reinterpret_cast<char*>(dst.data()) + got, want - got);
-            if (n <= 0) break;
-            got += n;
-        }
-        if (on_bytes) on_bytes(got);
-    });
+    writer.write_file( /// report as they hit the disk instead of the read speed of the file]
+        dst_dir, name, static_cast<std::int64_t>(f.size()),
+        [&f](std::span<std::byte> dst) {
+            qint64 got = 0;
+            const qint64 want = static_cast<qint64>(dst.size());
+            while (got < want) {
+                const qint64 n = f.read(reinterpret_cast<char*>(dst.data()) + got, want - got);
+                if (n <= 0) break;
+                got += n;
+            }
+        },
+        on_bytes);
 }
 
 void import_contents(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QString& host_dir, std::uint64_t dst_dir, const std::function<void(qint64)>& on_bytes, int depth = 0) {
@@ -361,12 +365,14 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
     clock.start();
     qint64 total = 0, bytes_done = 0, last_bytes = 0, last_ms = 0;
     int last_pct = -1;
+    double peak_bps = 0.0;
     auto report = [&](qint64 n) {
         bytes_done += n;
         const int pct = total > 0 ? static_cast<int>(100 * bytes_done / total) : 100;
         const qint64 now = clock.elapsed();
         if (pct != last_pct || now - last_ms >= 400) {
             const double bps = now > last_ms ? (bytes_done - last_bytes) * 1000.0 / (now - last_ms) : 0.0;
+            if (bps > peak_bps) peak_bps = bps;
             last_pct = pct;
             last_bytes = bytes_done;
             last_ms = now;
@@ -459,8 +465,18 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
             extra = QStringLiteral("  |  %1").arg(dbmsg);
         }
     }
+
+    QString xfer;
+    if (bytes_done > 0) {
+        const qint64 ms = clock.elapsed();
+        const double avg = ms > 0 ? bytes_done * 1000.0 / ms : 0.0;
+        const double secs = ms / 1000.0;
+        const QString dur = secs < 60 ? QStringLiteral("%1 s").arg(secs, 0, 'f', 1) : QStringLiteral("%1m %2s").arg(static_cast<int>(secs) / 60).arg(static_cast<int>(secs) % 60);
+        auto sz = [](double b) { return QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(b))); };
+        xfer = QStringLiteral("  |  %1 in %2 (avg %3/s, peak %4/s)").arg(sz(static_cast<double>(bytes_done)), dur, sz(avg), sz(peak_bps));
+    }
     const bool cancelled = cancel_.load();
-    QString msg = QStringLiteral("%1 %2 item(s)%3%4").arg(cancelled ? QStringLiteral("Cancelled after") : QStringLiteral("Done:")).arg(done).arg(skipped ? QStringLiteral(" (%1 skipped)").arg(skipped) : QString()).arg(extra);
+    QString msg = QStringLiteral("%1 %2 item(s)%3%4%5").arg(cancelled ? QStringLiteral("Cancelled after") : QStringLiteral("Done:")).arg(done).arg(skipped ? QStringLiteral(" (%1 skipped)").arg(skipped) : QString()).arg(xfer).arg(extra);
     emit finished(true, msg);
     return;
 }

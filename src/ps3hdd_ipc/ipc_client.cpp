@@ -34,7 +34,9 @@ QByteArray make_request(Op op) {
 } // namespace
 
 broker_client::broker_client() = default;
-broker_client::~broker_client() = default;
+broker_client::~broker_client() {
+    try { flush(); } catch (...) {}
+}
 
 void broker_client::connect_to(quint16 port, const QByteArray& token, int timeout_ms) {
     sock_ = std::make_unique<QTcpSocket>();
@@ -59,6 +61,7 @@ bool broker_client::connected() const {
 
 QByteArray broker_client::request(const QByteArray& payload) {
     if (!sock_) throw std::runtime_error("disk helper not connected");
+    flush();
     if (!writeFrame(sock_.get(), payload))
         throw std::runtime_error("disk helper write failed: " + sock_->errorString().toStdString());
     QByteArray reply;
@@ -135,13 +138,49 @@ std::vector<std::byte> broker_client::read(std::uint64_t offset, std::uint64_t c
 }
 
 void broker_client::write(std::uint64_t offset, std::span<const std::byte> data) {
+    if (!sock_) throw std::runtime_error("disk helper not connected");
     QByteArray req = make_request(Op::Write);
     {
         QDataStream ds(&req, QIODevice::WriteOnly | QIODevice::Append);
         setStreamVersion(ds);
         ds << static_cast<quint64>(offset) << QByteArray(reinterpret_cast<const char*>(data.data()), static_cast<qsizetype>(data.size()));
     }
-    request(req);
+    // Pipelined: send and return without waiting for the reply, so the caller's next
+    // read/encrypt overlaps the helper's disk write instead of serialising behind it.
+    // Keep a bounded number in flight; when full, consume one reply before sending.
+    while (outstanding_ >= kMaxOutstanding) drain_one();
+    if (!writeFrame(sock_.get(), req))
+        throw std::runtime_error("disk helper write failed: " + sock_->errorString().toStdString());
+    // writeFrame only stages into QTcpSocket's buffer; with no event loop nothing reaches
+    // the kernel until we pump it. Push the whole frame now so the helper can start on it
+    // while we go and prepare the next one (the TCP window is the real backpressure).
+    while (sock_->bytesToWrite() > 0) {
+        if (!sock_->waitForBytesWritten(kIoTimeoutMs))
+            throw std::runtime_error("disk helper write failed: " + sock_->errorString().toStdString());
+    }
+    ++outstanding_;
+}
+
+void broker_client::drain_one() {
+    QByteArray reply;
+    if (!readFrameBlocking(sock_.get(), reply, kIoTimeoutMs))
+        throw std::runtime_error("disk helper did not respond!");
+    --outstanding_; // the reply was consumed even if it reports an error
+    QDataStream ds(reply);
+    setStreamVersion(ds);
+    quint32 status = 0;
+    ds >> status;
+    if (static_cast<Status>(status) != Status::Ok) {
+        QString msg;
+        ds >> msg;
+        if (msg.isEmpty()) msg = QStringLiteral("disk helper error %1").arg(status);
+        throw std::runtime_error(msg.toStdString());
+    }
+}
+
+void broker_client::flush() {
+    if (!sock_) return;
+    while (outstanding_ > 0) drain_one();
 }
 
 broker_client::eject_result broker_client::eject(const QString& path) {
@@ -162,6 +201,7 @@ broker_client::eject_result broker_client::eject(const QString& path) {
 void broker_client::quit() {
     if (!sock_) return;
     try {
+        flush();
         writeFrame(sock_.get(), make_request(Op::Quit));
         sock_->flush();
         sock_->waitForBytesWritten(1000);
@@ -186,6 +226,10 @@ void ipc_disk_source::write_bytes(std::uint64_t offset, std::span<const std::byt
 
 void ipc_disk_source::write_sectors(std::uint64_t start_sector, std::span<const std::byte> data) {
     client_.write(start_sector * sector_size_, data);
+}
+
+void ipc_disk_source::flush() {
+    client_.flush();
 }
 
 

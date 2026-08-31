@@ -23,6 +23,7 @@ public:
 
     virtual void write_sectors(std::uint64_t start_sector, std::span<const std::byte> data) = 0;
     virtual void write_bytes(std::uint64_t offset, std::span<const std::byte> data) = 0;
+    virtual void flush() {}
 };
 
 std::string format_size(std::uint64_t bytes);

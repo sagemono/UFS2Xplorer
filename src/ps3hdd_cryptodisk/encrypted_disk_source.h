@@ -22,6 +22,7 @@ public:
     std::vector<std::byte> read_bytes(std::uint64_t offset, std::size_t count) override;
     void write_sectors(std::uint64_t start_sector, std::span<const std::byte> plaintext) override;
     void write_bytes(std::uint64_t offset, std::span<const std::byte> data) override;
+    void flush() override { inner_->flush(); }
 
     disk::disk_source& inner() { return *inner_; }
 

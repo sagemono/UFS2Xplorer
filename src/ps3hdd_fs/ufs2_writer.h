@@ -63,7 +63,7 @@ public:
     std::uint64_t create_directory(std::uint64_t parent_inode, const std::string& name);
     std::uint64_t write_file(std::uint64_t parent_inode, const std::string& name, std::span<const std::byte> data);
 
-    std::uint64_t write_file(std::uint64_t parent_inode, const std::string& name, std::int64_t size, const std::function<void(std::span<std::byte>)>& fill);
+    std::uint64_t write_file(std::uint64_t parent_inode, const std::string& name, std::int64_t size, const std::function<void(std::span<std::byte>)>& fill, const std::function<void(std::int64_t)>& on_written = {});
 
     void delete_file(std::uint64_t parent_inode, const std::string& name);
     void delete_directory(std::uint64_t parent_inode, const std::string& name);
