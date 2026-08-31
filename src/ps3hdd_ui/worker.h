@@ -37,7 +37,7 @@ struct job {
     quint16 broker_port = 0;
     QByteArray broker_token;
 
-    enum fileop { fop_none, fop_delete, fop_copy, fop_move, fop_import };
+    enum fileop { fop_none, fop_delete, fop_copy, fop_move, fop_import, fop_extract };
     struct fs_item {
         std::uint64_t parent = 0;
         QString name;
@@ -48,6 +48,7 @@ struct job {
     std::vector<fs_item> fop_items;
     std::uint64_t fop_dest = 0;
     QStringList fop_import_paths;
+    QString fop_host_dest;         // fop_extract: host file path (file) or base folder (dir)
     bool set_rebuild = false;
 };
 

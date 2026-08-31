@@ -70,18 +70,51 @@ int count_files(fs::ufs2_filesystem& ufs, std::uint64_t inode, bool is_dir, int 
     return n;
 }
 
-void copy_tree(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, std::uint64_t src_inode, bool is_dir, const std::string& name, std::uint64_t dst_dir, const std::function<void()>& on_file, int depth = 0) {
+qint64 count_bytes(fs::ufs2_filesystem& ufs, std::uint64_t inode, bool is_dir, int depth = 0) {
+    if (depth > 128) return 0;
+    if (!is_dir) return static_cast<qint64>(ufs.read_inode(inode).size);
+    qint64 n = 0;
+    for (const auto& e : ufs.read_directory(ufs.read_inode(inode))) {
+        if (e.name == "." || e.name == "..") continue;
+        n += count_bytes(ufs, e.inode_number, e.type == fs::dirent_type::directory, depth + 1);
+    }
+    return n;
+}
+
+void copy_tree(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, std::uint64_t src_inode, bool is_dir, const std::string& name, std::uint64_t dst_dir, const std::function<void(qint64)>& on_bytes, int depth = 0) {
     if (depth > 128) throw std::runtime_error("copy aborted: directory nesting too deep");
     if (is_dir) {
         const std::uint64_t newdir = writer.create_directory(dst_dir, name);
         for (const auto& e : ufs.read_directory(ufs.read_inode(src_inode))) {
             if (e.name == "." || e.name == "..") continue;
-            copy_tree(ufs, writer, e.inode_number, e.type == fs::dirent_type::directory, e.name, newdir, on_file, depth + 1);
+            copy_tree(ufs, writer, e.inode_number, e.type == fs::dirent_type::directory, e.name, newdir, on_bytes, depth + 1);
         }
     } else {
-        const auto data = ufs.read_inode_data(ufs.read_inode(src_inode));
-        writer.write_file(dst_dir, name, {data.data(), data.size()});
-        if (on_file) on_file();
+        const auto src_in = ufs.read_inode(src_inode);
+        const auto blocks = ufs.block_pointers(src_in);
+        std::uint64_t pos = 0;
+        writer.write_file(dst_dir, name, src_in.size, [&](std::span<std::byte> dst) {
+            ufs.read_range(blocks, pos, dst);
+            pos += dst.size();
+            if (on_bytes) on_bytes(static_cast<qint64>(dst.size()));
+        });
+    }
+}
+
+void extract_tree(fs::ufs2_filesystem& ufs, std::uint64_t src_inode, bool is_dir, const QString& host_path, const std::function<void(qint64)>& on_bytes) {
+    if (is_dir) {
+        QDir().mkpath(host_path);
+        for (const auto& e : ufs.read_directory(ufs.read_inode(src_inode))) {
+            if (e.name == "." || e.name == "..") continue;
+            extract_tree(ufs, e.inode_number, e.type == fs::dirent_type::directory, host_path + QStringLiteral("/") + QString::fromStdString(e.name), on_bytes);
+        }
+    } else {
+        QFile f(host_path);
+        if (!f.open(QIODevice::WriteOnly)) throw std::runtime_error("cannot write " + host_path.toStdString());
+        ufs.extract_inode(ufs.read_inode(src_inode), [&](std::span<const std::byte> chunk) {
+            f.write(reinterpret_cast<const char*>(chunk.data()), static_cast<qint64>(chunk.size()));
+            if (on_bytes) on_bytes(static_cast<qint64>(chunk.size()));
+        });
     }
 }
 
@@ -211,7 +244,7 @@ void worker::run() {
             return;
         }
 
-        const bool writable = job_.file_operation != job::fop_none || job_.type != job::consistency;
+        const bool writable = job_.file_operation != job::fop_none ? job_.file_operation != job::fop_extract : job_.type != job::consistency;
         emit progress(QStringLiteral("Connecting to the disk helper ..."), -1);
         broker.connect_to(job_.broker_port, job_.broker_token, 8000);
         emit progress(QStringLiteral("Opening %1 ...").arg(job_.device), -1);
@@ -353,18 +386,21 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
     }
     case job::fop_copy: {
         emit progress(QStringLiteral("Scanning ..."), -1);
-        int total_files = 0;
+        qint64 total_bytes = 0;
         for (const auto& it : job_.fop_items)
-            total_files += count_files(ufs, it.inode, it.is_dir);
-        int copied = 0;
+            total_bytes += count_bytes(ufs, it.inode, it.is_dir);
+        qint64 bytes_done = 0;
+        int last_pct = -1;
         for (const auto& it : job_.fop_items) {
             if (cancel_.load()) break;
-            emit progress(QStringLiteral("Copying %1 (%2 files) ...").arg(it.name).arg(total_files), total_files > 0 ? 100 * copied / total_files : -1);
-            auto on_file = [&] {
-                ++copied;
-                emit progress({}, total_files > 0 ? 100 * copied / total_files : 100);
+            emit progress(QStringLiteral("Copying %1 ...").arg(it.name),
+                          total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : -1);
+            auto on_bytes = [&](qint64 n) {
+                bytes_done += n;
+                const int pct = total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : 100;
+                if (pct != last_pct) { last_pct = pct; emit progress({}, pct); }
             };
-            copy_tree(ufs, writer, it.inode, it.is_dir, unique_child_name(ufs, job_.fop_dest, it.name.toStdString()), job_.fop_dest, on_file);
+            copy_tree(ufs, writer, it.inode, it.is_dir, unique_child_name(ufs, job_.fop_dest, it.name.toStdString()), job_.fop_dest, on_bytes);
             ++done;
         }
         break;
@@ -389,6 +425,27 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
             } catch (const std::exception&) {
                 ++skipped;
             }
+        }
+        break;
+    }
+    case job::fop_extract: {
+        emit progress(QStringLiteral("Scanning ..."), -1);
+        qint64 total_bytes = 0;
+        for (const auto& it : job_.fop_items) total_bytes += count_bytes(ufs, it.inode, it.is_dir);
+        qint64 bytes_done = 0;
+        int last_pct = -1;
+        for (const auto& it : job_.fop_items) {
+            if (cancel_.load()) break;
+            emit progress(QStringLiteral("Extracting %1 ...").arg(it.name), total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : -1);
+            auto on_bytes = [&](qint64 n) {
+                bytes_done += n;
+                const int pct = total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : 100;
+                if (pct != last_pct) { last_pct = pct; emit progress({}, pct); }
+            };
+            const QString dest =
+                it.is_dir ? job_.fop_host_dest + QStringLiteral("/") + it.name : job_.fop_host_dest;
+            extract_tree(ufs, it.inode, it.is_dir, dest, on_bytes);
+            ++done;
         }
         break;
     }

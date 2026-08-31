@@ -3,6 +3,7 @@
 #include <ps3hdd_crypto/be_io.h>
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 namespace ps3hdd::fs {
@@ -64,6 +65,28 @@ std::vector<std::int64_t> ufs2_filesystem::all_block_pointers(const inode& in) {
     if (in.double_indirect_block) collect_block_pointers(in.double_indirect_block, 2, ptrs);
     if (in.triple_indirect_block) collect_block_pointers(in.triple_indirect_block, 3, ptrs);
     return ptrs;
+}
+
+void ufs2_filesystem::read_range(const std::vector<std::int64_t>& blocks, std::uint64_t file_offset, std::span<std::byte> out) {
+    const std::uint64_t bs = static_cast<std::uint64_t>(sb_.block_size);
+    const std::int64_t fpb = sb_.fragment_size > 0 ? sb_.block_size / sb_.fragment_size : 0;
+    std::size_t done = 0;
+    while (done < out.size() && bs > 0) {
+        const std::uint64_t fpos = file_offset + done;
+        const std::size_t bidx = static_cast<std::size_t>(fpos / bs);
+        if (bidx >= blocks.size()) break;
+        const std::uint64_t boff = fpos % bs;
+        const std::int64_t frag = blocks[bidx];
+        if (frag <= 0 || fpb <= 0 || (sb_.total_fragments > 0 && frag + fpb > sb_.total_fragments))
+            throw std::runtime_error("read_range: fragment address out of range");
+        const std::uint64_t byte_off =
+            partition_offset_ + static_cast<std::uint64_t>(frag) * sb_.fragment_size + boff;
+        const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(bs - boff, out.size() - done));
+        auto data = disk_.read_bytes(byte_off, chunk);
+        std::memcpy(out.data() + done, data.data(), std::min(chunk, data.size()));
+        done += chunk;
+    }
+    if (done < out.size()) std::memset(out.data() + done, 0, out.size() - done); // zero any unfilled tail
 }
 
 void ufs2_filesystem::extract_inode(const inode& in, const std::function<void(std::span<const std::byte>)>& sink, const std::function<void(std::uint64_t)>& progress) {

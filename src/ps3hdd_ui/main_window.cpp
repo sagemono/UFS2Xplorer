@@ -1551,39 +1551,26 @@ void main_window::act_extract() {
     const QModelIndex idx = tree_->currentIndex();
     if (!idx.isValid() || !fs_) return;
     const std::uint64_t inode = model_->inode_of(idx);
+    const bool is_dir = model_->is_dir(idx);
     const QString name = model_->is_root(idx) ? QStringLiteral("root") : model_->name_of(idx);
-    auto extract_file = [this](std::uint64_t ino, const QString& out_path) {
-        QFile f(out_path);
-        if (!f.open(QIODevice::WriteOnly)) throw std::runtime_error("cannot write " + out_path.toStdString());
-        fs_->extract_inode(fs_->read_inode(ino), [&f](std::span<const std::byte> chunk) {
-            f.write(reinterpret_cast<const char*>(chunk.data()), static_cast<qint64>(chunk.size()));
-        });
-    };
-    try {
-        if (model_->is_dir(idx)) {
-            const QString base = QFileDialog::getExistingDirectory(this, QStringLiteral("Extract folder into"));
-            if (base.isEmpty()) return;
-            std::function<void(std::uint64_t, const QString&)> rec = [&](std::uint64_t din, const QString& dir) {
-                QDir().mkpath(dir);
-                for (const auto& e : fs_->read_directory(fs_->read_inode(din))) {
-                    if (e.name == "." || e.name == "..") continue;
-                    const QString child = dir + QStringLiteral("/") + QString::fromStdString(e.name);
-                    if (e.type == fs::dirent_type::directory)
-                        rec(e.inode_number, child);
-                    else
-                        extract_file(e.inode_number, child);
-                }
-            };
-            rec(inode, base + QStringLiteral("/") + name);
-        } else {
-            const QString out = QFileDialog::getSaveFileName(this, QStringLiteral("Extract file"), name);
-            if (out.isEmpty()) return;
-            extract_file(inode, out);
-        }
-        log(QStringLiteral("Extracted %1").arg(name));
-    } catch (const std::exception& ex) {
-        log(QStringLiteral("extract error: %1").arg(QString::fromUtf8(ex.what())));
+
+    QString host_dest;
+    if (is_dir) {
+        const QString base = QFileDialog::getExistingDirectory(this, QStringLiteral("Extract folder into"));
+        if (base.isEmpty()) return;
+        host_dest = base; // the worker writes it under base/<name>
+    } else {
+        const QString out = QFileDialog::getSaveFileName(this, QStringLiteral("Extract file"), name);
+        if (out.isEmpty()) return;
+        host_dest = out;
     }
+
+    job j;
+    if (!base_job(j)) return;
+    j.file_operation = job::fop_extract;
+    j.fop_items.push_back({0, name, inode, is_dir});
+    j.fop_host_dest = host_dest;
+    start_job(std::move(j), QStringLiteral("Extract"));
 }
 
 void main_window::act_new_folder() {
