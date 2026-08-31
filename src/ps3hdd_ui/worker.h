@@ -64,6 +64,7 @@ public slots:
 signals:
     void progress(QString line, int percent);
     void finished(bool ok, QString summary);
+    void speed(double bytes_per_sec);
 
 private:
     void run_verify_pkg();

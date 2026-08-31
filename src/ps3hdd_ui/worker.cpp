@@ -17,6 +17,7 @@
 
 #include <QCryptographicHash>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 
@@ -355,6 +356,25 @@ void worker::run_verify_pkg() {
 void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     fs::ufs2_writer writer(ufs, *m.decrypted);
     int done = 0, skipped = 0;
+
+    QElapsedTimer clock;
+    clock.start();
+    qint64 total = 0, bytes_done = 0, last_bytes = 0, last_ms = 0;
+    int last_pct = -1;
+    auto report = [&](qint64 n) {
+        bytes_done += n;
+        const int pct = total > 0 ? static_cast<int>(100 * bytes_done / total) : 100;
+        const qint64 now = clock.elapsed();
+        if (pct != last_pct || now - last_ms >= 400) {
+            const double bps = now > last_ms ? (bytes_done - last_bytes) * 1000.0 / (now - last_ms) : 0.0;
+            last_pct = pct;
+            last_bytes = bytes_done;
+            last_ms = now;
+            emit progress({}, pct);
+            emit speed(bps);
+        }
+    };
+
     switch (job_.file_operation) {
     case job::fop_delete: {
         const int total = static_cast<int>(job_.fop_items.size());
@@ -386,41 +406,25 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
     }
     case job::fop_copy: {
         emit progress(QStringLiteral("Scanning ..."), -1);
-        qint64 total_bytes = 0;
-        for (const auto& it : job_.fop_items)
-            total_bytes += count_bytes(ufs, it.inode, it.is_dir);
-        qint64 bytes_done = 0;
-        int last_pct = -1;
+        for (const auto& it : job_.fop_items) total += count_bytes(ufs, it.inode, it.is_dir);
         for (const auto& it : job_.fop_items) {
             if (cancel_.load()) break;
             emit progress(QStringLiteral("Copying %1 ...").arg(it.name),
-                          total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : -1);
-            auto on_bytes = [&](qint64 n) {
-                bytes_done += n;
-                const int pct = total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : 100;
-                if (pct != last_pct) { last_pct = pct; emit progress({}, pct); }
-            };
-            copy_tree(ufs, writer, it.inode, it.is_dir, unique_child_name(ufs, job_.fop_dest, it.name.toStdString()), job_.fop_dest, on_bytes);
+                          total > 0 ? static_cast<int>(100 * bytes_done / total) : -1);
+            copy_tree(ufs, writer, it.inode, it.is_dir, unique_child_name(ufs, job_.fop_dest, it.name.toStdString()), job_.fop_dest, report);
             ++done;
         }
         break;
     }
     case job::fop_import: {
         emit progress(QStringLiteral("Scanning ..."), -1);
-        qint64 total_bytes = 0;
-        for (const QString& p : job_.fop_import_paths) total_bytes += count_host_bytes(p);
-        qint64 bytes_done = 0;
-        int last_pct = -1;
+        for (const QString& p : job_.fop_import_paths) total += count_host_bytes(p);
         for (const QString& path : job_.fop_import_paths) {
             if (cancel_.load()) break;
             emit progress(QStringLiteral("Importing %1 ...").arg(QFileInfo(path).fileName()),
-                          total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : -1);
+                          total > 0 ? static_cast<int>(100 * bytes_done / total) : -1);
             try {
-                import_path(ufs, writer, path, job_.fop_dest, [&](qint64 n) {
-                    bytes_done += n;
-                    const int pct = total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : 100;
-                    if (pct != last_pct) { last_pct = pct; emit progress({}, pct); }
-                });
+                import_path(ufs, writer, path, job_.fop_dest, report);
                 ++done;
             } catch (const std::exception&) {
                 ++skipped;
@@ -430,21 +434,14 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
     }
     case job::fop_extract: {
         emit progress(QStringLiteral("Scanning ..."), -1);
-        qint64 total_bytes = 0;
-        for (const auto& it : job_.fop_items) total_bytes += count_bytes(ufs, it.inode, it.is_dir);
-        qint64 bytes_done = 0;
-        int last_pct = -1;
+        for (const auto& it : job_.fop_items) total += count_bytes(ufs, it.inode, it.is_dir);
         for (const auto& it : job_.fop_items) {
             if (cancel_.load()) break;
-            emit progress(QStringLiteral("Extracting %1 ...").arg(it.name), total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : -1);
-            auto on_bytes = [&](qint64 n) {
-                bytes_done += n;
-                const int pct = total_bytes > 0 ? static_cast<int>(100 * bytes_done / total_bytes) : 100;
-                if (pct != last_pct) { last_pct = pct; emit progress({}, pct); }
-            };
+            emit progress(QStringLiteral("Extracting %1 ...").arg(it.name),
+                          total > 0 ? static_cast<int>(100 * bytes_done / total) : -1);
             const QString dest =
                 it.is_dir ? job_.fop_host_dest + QStringLiteral("/") + it.name : job_.fop_host_dest;
-            extract_tree(ufs, it.inode, it.is_dir, dest, on_bytes);
+            extract_tree(ufs, it.inode, it.is_dir, dest, report);
             ++done;
         }
         break;

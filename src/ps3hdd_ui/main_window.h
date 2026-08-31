@@ -126,6 +126,7 @@ private:
     key_store keys_;
     QComboBox* device_combo_ = nullptr;
     QLabel* status_ = nullptr;
+    QLabel* speed_label_ = nullptr;
     QString mount_desc_;
     QTreeView* tree_ = nullptr;
     ufs2_model* model_ = nullptr;

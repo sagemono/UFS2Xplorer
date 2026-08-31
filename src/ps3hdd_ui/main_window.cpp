@@ -174,12 +174,13 @@ main_window::main_window() {
     status_ = new QLabel(QStringLiteral("No disk mounted."));
     status_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     statusBar()->addWidget(status_, 1);
+    speed_label_ = new QLabel();
+    statusBar()->addPermanentWidget(speed_label_);
 
     build_action_row(root);
     build_browser(root);
 
     setCentralWidget(central);
-    statusBar()->showMessage(QStringLiteral("No disk mounted."));
 
     wire_signals(refresh, open);
 
@@ -864,6 +865,7 @@ void main_window::set_busy(bool busy) {
     cancel_btn_->setEnabled(busy);
     progress_->setVisible(busy);
     if (busy) progress_->setRange(0, 0);
+    if (!busy && speed_label_) speed_label_->clear();
 }
 
 void main_window::start_job(job j, const QString& title) {
@@ -885,6 +887,9 @@ void main_window::start_job(job j, const QString& title) {
         if (percent >= 0) { progress_->setRange(0, 100); progress_->setValue(percent); }
         else progress_->setRange(0, 0);
         if (!line.isEmpty()) log(line);
+    });
+    connect(w, &worker::speed, this, [this](double bps) {
+        speed_label_->setText(bps > 0 ? QStringLiteral("%1/s").arg(QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(bps)))) : QString());
     });
     connect(w, &worker::finished, this,
             [this, w, was_write, is_fileop, is_pkg_install](bool ok, const QString& summary) {
