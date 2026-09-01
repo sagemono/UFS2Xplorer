@@ -13,6 +13,7 @@ namespace tuf {
 
 using ps3hdd::write_be_u16;
 using ps3hdd::write_be_u32;
+using ps3hdd::write_be_u64;
 using ps3hdd::fs::cylinder_group;
 using ps3hdd::fs::superblock;
 using ps3hdd::fs::ufs2_writer;
@@ -35,6 +36,7 @@ inline constexpr int kClusteroff = 720;
 inline constexpr int kClustersumoff = 784;
 inline constexpr int kNclusterblks = kFpg / kFpb;
 inline constexpr int kInitInited = 64;
+inline constexpr int kCsFrags = kFpb;
 
 inline void set_bit(std::vector<std::byte>& d, std::size_t base, int idx) {
     d[base + idx / 8] |= static_cast<std::byte>(1 << (idx % 8));
@@ -52,7 +54,22 @@ inline void write_superblock(std::vector<std::byte>& img, int ncg) {
     write_be_u32(b + 0x14, kDblkno);
     write_be_u32(b + 0xA0, kCgSize);
     write_be_u32(b + 0x2C, static_cast<std::uint32_t>(ncg));
+
+    write_be_u32(b + 0x38, kFpb);                              // fs_frag
+    write_be_u32(b + 0x54, 11);                                // fs_fshift  (log2 kFrag)
+    write_be_u32(b + 0x5C, kBlock / 8);                        // fs_maxbpg
+    write_be_u32(b + 0x60, 3);                                 // fs_fragshift (log2 kFpb)
+    write_be_u32(b + 0x64, 2);                                 // fs_fsbtodb (kFrag/512)
+    write_be_u32(b + 0x74, kBlock / 8);                        // fs_nindir
+    write_be_u32(b + 0x9C, static_cast<std::uint32_t>(ncg) * 16); // fs_cssize
+    write_be_u64(b + 0x438, static_cast<std::uint64_t>(ncg) * kFpg);               // fs_size
+    write_be_u64(b + 0x440, static_cast<std::uint64_t>(ncg) * (kFpg - kDblkno));   // fs_dsize
+    write_be_u64(b + 0x448, static_cast<std::uint64_t>(kDblkno)); // fs_csaddr
+    write_be_u32(b + 0x4AC, kBlock);                           // fs_avgfilesize
+    write_be_u32(b + 0x4B0, 64);                               // fs_avgfpdir
+    write_be_u32(b + 0x524, 8);                                // fs_contigsumsize
 }
+
 
 inline std::uint64_t cg_header_offset(int cg) {
     return static_cast<std::uint64_t>(static_cast<std::int64_t>(cg) * kFpg + kCblkno) * kFrag;
@@ -64,7 +81,8 @@ inline void write_cg_header(std::vector<std::byte>& img, int cg) {
     write_be_u32(h + 0x04, cylinder_group::magic_value);
     write_be_u32(h + 0x0C, static_cast<std::uint32_t>(cg));
     write_be_u32(h + 0x14, kFpg);
-    write_be_u32(h + 0x1C, static_cast<std::uint32_t>((kFpg - kDblkno) / kFpb));
+    const int first_free = (cg == 0) ? kDblkno + kCsFrags : kDblkno;
+    write_be_u32(h + 0x1C, static_cast<std::uint32_t>((kFpg - first_free) / kFpb));
     write_be_u32(h + 0x20, kIpg);
     write_be_u32(h + 0x24, 0);
     write_be_u32(h + 0x5C, kIusedoff);
@@ -75,15 +93,48 @@ inline void write_cg_header(std::vector<std::byte>& img, int cg) {
     write_be_u32(h + 0x78, kInitInited);
 
     std::vector<std::byte> raw(img.begin() + base, img.begin() + base + kCgSize);
-    for (int f = kDblkno; f < kFpg; ++f) set_bit(raw, kFreeoff, f);
-    for (int bl = kDblkno / kFpb; bl < kNclusterblks; ++bl) set_bit(raw, kClusteroff, bl);
+    for (int f = first_free; f < kFpg; ++f) set_bit(raw, kFreeoff, f);
+    for (int bl = first_free / kFpb; bl < kNclusterblks; ++bl) set_bit(raw, kClusteroff, bl);
+    write_be_u32(raw.data() + kClustersumoff + 4 * 8, 1);
     std::memcpy(img.data() + base, raw.data(), raw.size());
+}
+
+inline void write_cs_array(std::vector<std::byte>& img, int ncg) {
+    std::byte* cs = img.data() + static_cast<std::size_t>(kDblkno) * kFrag;
+    std::uint64_t t_ndir = 0, t_nbfree = 0, t_nifree = 0, t_nffree = 0;
+    for (int i = 0; i < ncg; ++i) {
+        const std::byte* h = img.data() + cg_header_offset(i);
+        std::byte* e = cs + static_cast<std::size_t>(i) * 16;
+        write_be_u32(e + 0, 0);                              // cs_ndir
+        write_be_u32(e + 4, ps3hdd::read_be_u32(h + 0x1C));  // cs_nbfree
+        write_be_u32(e + 8, ps3hdd::read_be_u32(h + 0x20));  // cs_nifree
+        write_be_u32(e + 12, ps3hdd::read_be_u32(h + 0x24)); // cs_nffree
+        t_nbfree += ps3hdd::read_be_u32(h + 0x1C);
+        t_nifree += ps3hdd::read_be_u32(h + 0x20);
+        t_nffree += ps3hdd::read_be_u32(h + 0x24);
+    }
+
+    std::byte* b = img.data() + 65536;
+    write_be_u64(b + 0x3F0, t_ndir);
+    write_be_u64(b + 0x3F8, t_nbfree);
+    write_be_u64(b + 0x400, t_nifree);
+    write_be_u64(b + 0x408, t_nffree);
 }
 
 inline th::memory_disk_source build_cg_image() {
     th::memory_disk_source disk(512 * 1024);
     write_superblock(disk.store(), 1);
     write_cg_header(disk.store(), 0);
+    write_cs_array(disk.store(), 1);
+    return disk;
+}
+
+inline th::memory_disk_source build_n_cg_image(int ncg) {
+    const std::size_t bytes = static_cast<std::size_t>(ncg) * kFpg * kFrag;
+    th::memory_disk_source disk(bytes);
+    write_superblock(disk.store(), ncg);
+    for (int i = 0; i < ncg; ++i) write_cg_header(disk.store(), i);
+    write_cs_array(disk.store(), ncg);
     return disk;
 }
 
@@ -93,6 +144,7 @@ inline th::memory_disk_source build_two_cg_image() {
     write_superblock(disk.store(), 2);
     write_cg_header(disk.store(), 0);
     write_cg_header(disk.store(), 1);
+    write_cs_array(disk.store(), 2);
     return disk;
 }
 

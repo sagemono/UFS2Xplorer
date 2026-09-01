@@ -24,9 +24,21 @@ public:
         walk_dir(ufs2_filesystem::root_inode);
         check_bitmaps();
         check_cg_summaries();
+        check_orphan_inodes();
+        check_cs_array();
         report_.inodes_walked = static_cast<std::int64_t>(visited_.size());
         report_.fragments_claimed = static_cast<std::int64_t>(claims_.size());
         return std::move(report_);
+    }
+
+    std::vector<bool> claimed_map() {
+        walk_dir(ufs2_filesystem::root_inode);
+        std::vector<bool> m(static_cast<std::size_t>(std::max<std::int64_t>(sb_.total_fragments, 0)), false);
+        for (const auto& [frag, c] : claims_) {
+            (void)c;
+            if (frag >= 0 && static_cast<std::size_t>(frag) < m.size()) m[static_cast<std::size_t>(frag)] = true;
+        }
+        return m;
     }
 
 private:
@@ -151,7 +163,135 @@ private:
             const bool is_free = (std::to_integer<int>(raw[byte]) >> (fic % 8)) & 1;
             if (is_free) {
                 ++report_.used_but_free;
+                report_.used_but_free_frags.push_back(frag);
                 note("used-but-free frag " + std::to_string(frag) + " (cg " + std::to_string(cgn) + "): inode " + std::to_string(inum) + " holds it but bitmap says free");
+            }
+        }
+    }
+
+    void check_orphan_inodes() {
+        const int ipg = static_cast<int>(sb_.inodes_per_group);
+        if (ipg <= 0) return;
+        auto bit = [](const std::vector<std::byte>& d, int base, int idx) {
+            const std::size_t b = static_cast<std::size_t>(base) + idx / 8;
+            return b < d.size() && ((std::to_integer<int>(d[b]) >> (idx % 8)) & 1);
+        };
+        for (int cgn = 0; cgn < sb_.cylinder_groups; ++cgn) {
+            auto [raw, freeoff] = read_cg(cgn);
+            (void)freeoff;
+            if (raw.empty()) continue;
+            const int iusedoff = static_cast<int>(static_cast<std::int32_t>(ps3hdd::read_be_u32(raw.data() + 0x5C)));
+            for (int i = 0; i < ipg; ++i) {
+                if (!bit(raw, iusedoff, i)) continue;
+                const std::uint64_t ino = static_cast<std::uint64_t>(cgn) * ipg + i;
+                if (ino < 2) continue;
+                if (visited_.count(ino)) continue;
+                ++report_.orphan_inodes;
+                report_.orphan_all_inodes.push_back(static_cast<std::int64_t>(ino));
+
+                int nlink = -1;
+                std::uint16_t mode = 0;
+                try {
+                    const auto raw = fs_.read_inode_raw(ino);
+                    if (raw.size() >= 4) {
+                        mode = ps3hdd::read_be_u16(raw.data() + 0x00);
+                        nlink = static_cast<std::int16_t>(ps3hdd::read_be_u16(raw.data() + 0x02));
+                    }
+                } catch (const std::exception&) {
+                }
+                if (nlink == 0 || (nlink >= 0 && mode == 0)) {
+                    ++report_.orphan_inodes_unlinked;
+                    report_.orphan_unlinked_inodes.push_back(static_cast<std::int64_t>(ino));
+                } else if (nlink > 0) {
+                    ++report_.orphan_inodes_linked;
+                }
+                note("orphan inode " + std::to_string(ino) + " (cg " + std::to_string(cgn) + "): used in the bitmap but unreachable from root; mode=0" + std::to_string(mode) + " nlink=" + std::to_string(nlink) + (nlink == 0 || mode == 0 ? " [reclaimable]" : " [LINKED - lost data]"));
+            }
+        }
+    }
+
+    void check_cs_array() {
+        const int ncg = sb_.cylinder_groups;
+        if (ncg <= 0 || sb_.cs_address <= 0 || sb_.fragment_size <= 0) return;
+        const std::size_t want = static_cast<std::size_t>(ncg) * 16;
+        std::vector<std::byte> cs;
+        try {
+            cs = disk_.read_bytes(fs_.partition_offset_bytes() + static_cast<std::uint64_t>(sb_.cs_address) * sb_.fragment_size, want);
+        } catch (const std::exception&) {
+            return;
+        }
+        if (cs.size() < want) return;
+
+        auto i32 = [](const std::vector<std::byte>& d, std::size_t o) {
+            return static_cast<std::int64_t>(static_cast<std::int32_t>(ps3hdd::read_be_u32(d.data() + o)));
+        };
+        std::int64_t tot_ndir = 0, tot_nbfree = 0, tot_nifree = 0, tot_nffree = 0;
+        for (int cgn = 0; cgn < ncg; ++cgn) {
+            auto [raw, freeoff] = read_cg(cgn);
+            (void)freeoff;
+            if (raw.empty()) continue;
+            const std::int64_t h_ndir = i32(raw, 0x18), h_nbfree = i32(raw, 0x1C), h_nifree = i32(raw, 0x20), h_nffree = i32(raw, 0x24);
+            const std::size_t o = static_cast<std::size_t>(cgn) * 16;
+            const std::int64_t c_ndir = i32(cs, o + 0), c_nbfree = i32(cs, o + 4), c_nifree = i32(cs, o + 8), c_nffree = i32(cs, o + 12);
+            if (c_ndir != h_ndir || c_nbfree != h_nbfree || c_nifree != h_nifree || c_nffree != h_nffree) {
+                ++report_.cs_array_mismatches;
+                note("cs-array entry for cg " + std::to_string(cgn) + " disagrees with the cg header: cs(" + std::to_string(c_ndir) + "," + std::to_string(c_nbfree) + "," + std::to_string(c_nifree) + "," + std::to_string(c_nffree) + ") vs cg(" + std::to_string(h_ndir) + "," + std::to_string(h_nbfree) + "," + std::to_string(h_nifree) + "," + std::to_string(h_nffree) + ")");
+            }
+            tot_ndir += h_ndir; tot_nbfree += h_nbfree; tot_nifree += h_nifree; tot_nffree += h_nffree;
+        }
+
+        try {
+            const auto sbd = disk_.read_bytes(fs_.partition_offset_bytes() + 65536, 8192);
+            auto i64 = [](const std::vector<std::byte>& d, std::size_t o) {
+                return static_cast<std::int64_t>(ps3hdd::read_be_u64(d.data() + o));
+            };
+            const std::int64_t s_ndir = i64(sbd, 0x3F0), s_nbfree = i64(sbd, 0x3F8), s_nifree = i64(sbd, 0x400), s_nffree = i64(sbd, 0x408);
+            if (s_ndir != tot_ndir || s_nbfree != tot_nbfree || s_nifree != tot_nifree || s_nffree != tot_nffree) {
+                ++report_.cstotal_mismatches;
+                note("fs_cstotal disagrees with the sum over cylinder groups: sb(" + std::to_string(s_ndir) + "," + std::to_string(s_nbfree) + "," + std::to_string(s_nifree) + "," + std::to_string(s_nffree) + ") vs sum(" + std::to_string(tot_ndir) + "," + std::to_string(tot_nbfree) + "," + std::to_string(tot_nifree) + "," + std::to_string(tot_nffree) + ")");
+            }
+        } catch (const std::exception&) {
+        }
+    }
+
+    void check_clusters(int cgn, const std::vector<std::byte>& raw, const std::vector<std::uint8_t>& want) {
+        const int contigsum = sb_.contig_sum_size;
+        if (contigsum <= 0) return;
+        auto i32 = [](const std::vector<std::byte>& d, std::size_t o) {
+            return static_cast<std::int64_t>(static_cast<std::int32_t>(ps3hdd::read_be_u32(d.data() + o)));
+        };
+        auto bit = [&](int base, int idx) {
+            const std::size_t b = static_cast<std::size_t>(base) + idx / 8;
+            return b < raw.size() && ((std::to_integer<int>(raw[b]) >> (idx % 8)) & 1);
+        };
+        const int clusteroff = static_cast<int>(i32(raw, 0x6C));
+        const int clustersumoff = static_cast<int>(i32(raw, 0x68));
+        int nclusterblks = static_cast<int>(i32(raw, 0x70));
+        if (clusteroff <= 0 || clustersumoff <= 0 || nclusterblks <= 0) return;
+        if (static_cast<std::size_t>(nclusterblks) > want.size())
+            nclusterblks = static_cast<int>(want.size());
+        std::int64_t bad_bits = 0;
+        for (int b = 0; b < nclusterblks; ++b)
+            if (bit(clusteroff, b) != (want[static_cast<std::size_t>(b)] != 0)) ++bad_bits;
+        if (bad_bits) {
+            report_.cluster_map_mismatches += bad_bits;
+            note("cg " + std::to_string(cgn) + " cluster free-map: " + std::to_string(bad_bits) + " block(s) disagree with the fragment bitmap");
+        }
+
+        std::vector<std::int64_t> csum(static_cast<std::size_t>(contigsum) + 1, 0);
+        int run = 0;
+        for (int b = 0; b <= nclusterblks; ++b) {
+            const bool free_here = b < nclusterblks && want[static_cast<std::size_t>(b)];
+            if (free_here) { ++run; continue; }
+            if (run > 0) ++csum[static_cast<std::size_t>(std::min(run, contigsum))];
+            run = 0;
+        }
+        for (int i = 1; i <= contigsum; ++i) {
+            const std::int64_t s = i32(raw, static_cast<std::size_t>(clustersumoff) + 4 * i);
+            if (s != csum[static_cast<std::size_t>(i)]) {
+                ++report_.cluster_sum_mismatches;
+                note("cg " + std::to_string(cgn) + " clustersum[" + std::to_string(i) + "] stored " +
+                     std::to_string(s) + " actual " + std::to_string(csum[static_cast<std::size_t>(i)]));
             }
         }
     }
@@ -174,6 +314,8 @@ private:
 
             std::int64_t nbfree = 0, nffree = 0;
             std::vector<std::int64_t> frsum(fpb, 0);
+            std::vector<std::uint8_t> blockfree;
+            blockfree.reserve(static_cast<std::size_t>(fpg / fpb));
             for (int base = 0; base + fpb <= fpg; base += fpb) {
                 int freec = 0, run = 0;
                 std::vector<int> runs;
@@ -182,6 +324,7 @@ private:
                     else if (run > 0) { runs.push_back(run); run = 0; }
                 }
                 if (run > 0) runs.push_back(run);
+                blockfree.push_back(freec == fpb ? 1 : 0);
                 if (freec == fpb) ++nbfree;
                 else { nffree += freec; for (int r : runs) if (r >= 1 && r < fpb) ++frsum[r]; }
             }
@@ -203,15 +346,34 @@ private:
                     note("cg " + std::to_string(cgn) + " frsum[" + std::to_string(i) + "] stored " + std::to_string(s) + " actual " + std::to_string(frsum[i]));
                 }
             }
+
+            check_clusters(cgn, raw, blockfree);
         }
     }
 };
 
 } // namespace
 
+std::string consistency_report::summary_line() const {
+    char buf[512];
+    std::snprintf(buf, sizeof buf,
+                  "cross-links=%lld out-of-range=%lld used-but-free=%lld summary=%lld "
+                  "cs-array=%lld cstotal=%lld cluster-map=%lld cluster-sum=%lld orphans=%lld",
+                  (long long)cross_links, (long long)out_of_range, (long long)used_but_free,
+                  (long long)summary_mismatches, (long long)cs_array_mismatches,
+                  (long long)cstotal_mismatches, (long long)cluster_map_mismatches,
+                  (long long)cluster_sum_mismatches, (long long)orphan_inodes);
+    return buf;
+}
+
 consistency_report check_consistency(ufs2_filesystem& fs, disk::disk_source& disk, std::size_t max_findings) {
     checker c(fs, disk, max_findings);
     return c.run();
+}
+
+std::vector<bool> claimed_fragment_map(ufs2_filesystem& fs, disk::disk_source& disk) {
+    checker c(fs, disk, 0);
+    return c.claimed_map();
 }
 
 } // namespace ps3hdd::fs

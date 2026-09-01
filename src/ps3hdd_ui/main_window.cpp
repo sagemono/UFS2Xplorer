@@ -22,7 +22,7 @@
 #include <QSettings>
 
 #ifndef UFS2XPLORER_VERSION
-#define UFS2XPLORER_VERSION "0.9.3"
+#define UFS2XPLORER_VERSION "0.9.4"
 #endif
 #include <QApplication>
 #include <QCheckBox>
@@ -279,8 +279,8 @@ void main_window::build_action_row(QVBoxLayout* root) {
     install_btn_ = new QPushButton(QStringLiteral("Install PKG"));
     license_btn_ = new QPushButton(QStringLiteral("Install License"));
     fsck_btn_ = new QPushButton(QStringLiteral("Check Consistency"));
-    repair_btn_ = new QPushButton(QStringLiteral("Repair Free Counts"));
-    repair_btn_->setToolTip(QStringLiteral("Recompute each cylinder group's free-space counts from the bitmaps to fix summary-mismatches left by an interrupted write."));
+    repair_btn_ = new QPushButton(QStringLiteral("Repair Filesystem"));
+    repair_btn_->setToolTip(QStringLiteral("Rebuild each cylinder group's free-space counts, cluster map and cluster summary from the allocation bitmaps, and mark any in-use fragment that was wrongly flagged free back as allocated. Fixes what an interrupted write leaves behind. Never frees a block a file still references."));
     games_btn_ = new QPushButton(QStringLiteral("Installed Games"));
     games_btn_->setToolTip(QStringLiteral("List the games under /dev_hdd0/game and uninstall them."));
     rebuilddb_btn_ = new QPushButton(QStringLiteral("Rebuild DB"));

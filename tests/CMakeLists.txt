@@ -30,6 +30,9 @@ add_executable(ps3hdd_fs_tests
     test_ufs2_parse.cpp
     test_ufs2_filesystem.cpp
     test_ufs2_writer.cpp
+    test_ffs_policy.cpp
+    test_ffs_policy_writer.cpp
+    test_real_geometry_policy.cpp
 )
 
 target_link_libraries(ps3hdd_fs_tests PRIVATE

@@ -2,6 +2,7 @@
 
 #include <ps3hdd_crypto/be_io.h>
 
+#include <functional>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -31,6 +32,49 @@ inode ufs2_filesystem::read_inode(std::uint64_t inode_number) {
 
     auto data = disk_.read_bytes(inode_offset, superblock::inode_size);
     return inode::parse(data, inode_number);
+}
+
+std::vector<std::byte> ufs2_filesystem::read_inode_raw(std::uint64_t inode_number) {
+    if (!sb_.valid()) throw std::runtime_error("Filesystem not mounted.");
+    const std::uint64_t total_inodes = static_cast<std::uint64_t>(sb_.cylinder_groups) * static_cast<std::uint64_t>(sb_.inodes_per_group);
+    if (sb_.inodes_per_group <= 0 || inode_number >= total_inodes)
+        throw std::runtime_error("read_inode_raw: inode number out of range");
+
+    const std::int64_t group = static_cast<std::int64_t>(inode_number) / sb_.inodes_per_group;
+    const std::int64_t index = static_cast<std::int64_t>(inode_number) % sb_.inodes_per_group;
+    const std::uint64_t cg_offset = partition_offset_ + static_cast<std::uint64_t>(group) * sb_.frags_per_group * sb_.fragment_size;
+    const std::uint64_t inode_table = cg_offset + sb_.inode_block_offset * sb_.fragment_size;
+    return disk_.read_bytes(inode_table + static_cast<std::uint64_t>(index) * superblock::inode_size, superblock::inode_size);
+}
+
+std::vector<std::int64_t> ufs2_filesystem::block_pointers_with_holes(const inode& in) {
+    std::vector<std::int64_t> out;
+    if (sb_.block_size <= 0) return out;
+    const std::uint64_t want = (static_cast<std::uint64_t>(in.size) + sb_.block_size - 1) / sb_.block_size;
+
+    for (int i = 0; i < superblock::direct_blocks && out.size() < want; ++i)
+        out.push_back(in.direct_blocks[static_cast<std::size_t>(i)]);
+
+    const std::int64_t ppb = sb_.block_size / 8;
+    std::function<void(std::int64_t, int)> walk = [&](std::int64_t addr, int level) {
+        if (out.size() >= want) return;
+        std::uint64_t span = 1;
+        for (int l = 0; l < level; ++l) span *= static_cast<std::uint64_t>(ppb);
+        if (addr == 0) {
+            for (std::uint64_t i = 0; i < span && out.size() < want; ++i) out.push_back(0);
+            return;
+        }
+        auto blk = read_block(addr);
+        for (std::int64_t i = 0; i < ppb && out.size() < want; ++i) {
+            const auto p = static_cast<std::int64_t>(ps3hdd::read_be_u64(blk.data() + i * 8));
+            if (level == 1) out.push_back(p);
+            else walk(p, level - 1);
+        }
+    };
+    if (out.size() < want) walk(in.indirect_block, 1);
+    if (out.size() < want) walk(in.double_indirect_block, 2);
+    if (out.size() < want) walk(in.triple_indirect_block, 3);
+    return out;
 }
 
 std::vector<std::byte> ufs2_filesystem::read_block(std::int64_t fragment_address) {

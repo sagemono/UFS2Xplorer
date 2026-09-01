@@ -53,6 +53,7 @@ void write_superblock(std::vector<std::byte>& img, int ncg) {
     write_be_u32(b + 0x14, kDblkno); // fs_dblkno
     write_be_u32(b + 0xA0, kCgSize); // fs_cgsize
     write_be_u32(b + 0x2C, static_cast<std::uint32_t>(ncg)); // fs_ncg
+    write_be_u32(b + 0x524, 8); // fs_contigsumsize
 }
 
 std::uint64_t cg_header_offset(int cg) {

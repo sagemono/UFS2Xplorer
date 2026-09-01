@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
                 std::printf("Checking filesystem consistency ...\n");
                 const auto rep = fs::check_consistency(check, *m->decrypted);
                 std::printf("  cross_links=%lld out_of_range=%lld used_but_free=%lld\n", (long long)rep.cross_links, (long long)rep.out_of_range, (long long)rep.used_but_free);
-                if (!rep.clean()) {
+                if (!rep.safe_to_write()) {
                     for (const auto& f : rep.findings) std::printf("  %s\n", f.c_str());
                     std::printf("\nFAILED - filesystem inconsistent. Restore the disk.\n");
                     return 3;
@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
             std::printf("Checking filesystem consistency ...\n");
             const auto rep = fs::check_consistency(check, *m->decrypted);
             std::printf("  cross_links=%lld out_of_range=%lld used_but_free=%lld\n", (long long)rep.cross_links, (long long)rep.out_of_range, (long long)rep.used_but_free);
-            if (!rep.clean()) {
+            if (!rep.safe_to_write()) {
                 for (const auto& f : rep.findings) std::printf("  %s\n", f.c_str());
                 std::printf("\nFAILED! filesystem inconsistent. Restore the disk.\n");
                 return 3;
@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
         std::printf("Checking filesystem consistency ...\n"); //redundant
         const auto rep = fs::check_consistency(check, *m->decrypted); 
         std::printf("  cross_links=%lld out_of_range=%lld used_but_free=%lld\n", (long long)rep.cross_links, (long long)rep.out_of_range, (long long)rep.used_but_free);
-        if (!rep.clean()) {
+        if (!rep.safe_to_write()) {
             for (const auto& f : rep.findings) std::printf("  %s\n", f.c_str());
             std::printf("\nFAILED - filesystem inconsistent. Restore the disk and report this.\n");
             return 3;

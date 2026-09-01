@@ -145,15 +145,9 @@ void broker_client::write(std::uint64_t offset, std::span<const std::byte> data)
         setStreamVersion(ds);
         ds << static_cast<quint64>(offset) << QByteArray(reinterpret_cast<const char*>(data.data()), static_cast<qsizetype>(data.size()));
     }
-    // Pipelined: send and return without waiting for the reply, so the caller's next
-    // read/encrypt overlaps the helper's disk write instead of serialising behind it.
-    // Keep a bounded number in flight; when full, consume one reply before sending.
     while (outstanding_ >= kMaxOutstanding) drain_one();
     if (!writeFrame(sock_.get(), req))
         throw std::runtime_error("disk helper write failed: " + sock_->errorString().toStdString());
-    // writeFrame only stages into QTcpSocket's buffer; with no event loop nothing reaches
-    // the kernel until we pump it. Push the whole frame now so the helper can start on it
-    // while we go and prepare the next one (the TCP window is the real backpressure).
     while (sock_->bytesToWrite() > 0) {
         if (!sock_->waitForBytesWritten(kIoTimeoutMs))
             throw std::runtime_error("disk helper write failed: " + sock_->errorString().toStdString());

@@ -96,8 +96,8 @@ int main(int argc, char** argv) {
         // remount fresh and verify global consistency before declaring success.
         fs::ufs2_filesystem chk(*m->decrypted, m->partition_sector); chk.mount();
         const auto rep = fs::check_consistency(chk, *m->decrypted);
-        std::printf("consistency: cross-links=%lld out-of-range=%lld used-but-free=%lld summary=%lld -> %s\n", (long long)rep.cross_links, (long long)rep.out_of_range, (long long)rep.used_but_free, (long long)rep.summary_mismatches, rep.clean() ? "CLEAN" : "INCONSISTENT");
-        if (!rep.clean()) { std::fprintf(stderr, "REFUSING: filesystem inconsistent after write!\n"); return 1; }
+        std::printf("consistency: %s -> %s\n", rep.summary_line().c_str(), rep.clean() ? "CLEAN" : (rep.safe_to_write() ? "OK (orphans present)" : "INCONSISTENT"));
+        if (!rep.safe_to_write()) { std::fprintf(stderr, "REFUSING: filesystem inconsistent after write!\n"); return 1; }
         std::printf("wrote %zu file(s) to %s. OK.\n", files.size(), gdir.c_str());
         return 0;
     } catch (const std::exception& ex) {

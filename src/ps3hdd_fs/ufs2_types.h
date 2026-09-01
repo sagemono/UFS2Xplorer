@@ -44,6 +44,28 @@ struct superblock {
     std::int64_t free_inodes = 0;          // cs_nifree
     std::int64_t free_fragments = 0;       // cs_nffree
 
+    // fields lv2s allocator reads. offsets confirmed in ida
+    std::int32_t frag = 0;                 // 0x38  fs_frag fragments per block
+    std::int32_t min_free_percent = 0;     // 0x3C  fs_minfree
+    std::int32_t frag_shift = 0;           // 0x54  fs_fshift bytes -> fragments
+    std::int32_t max_blocks_per_group = 0; // 0x5C  fs_maxbpg
+    std::int32_t frag_to_block_shift = 0;  // 0x60  fs_fragshift fragments -> blocks
+    std::int32_t frag_to_disk_shift = 0;   // 0x64  fs_fsbtodb
+    std::int32_t sb_size = 0;              // 0x68  fs_sbsize
+    // 0 = FS_OPTTIME, 1 = FS_OPTSPACE. //unlock_hdd_space.h
+    std::int32_t optim = 0;                // 0x80  fs_optim
+    std::int32_t cs_size = 0;              // 0x9C  fs_cssize bytes of the cs array
+    std::int32_t indirect_per_block = 0;   // 0x74  fs_nindir
+    std::int64_t sb_location = 0;          // 0x3E8 fs_sblockloc
+    std::int64_t cs_address = 0;           // 0x448 fs_csaddr fragment addr of cs array
+    std::int32_t avg_file_size = 0;        // 0x4AC fs_avgfilesize
+    std::int32_t avg_files_per_dir = 0;    // 0x4B0 fs_avgfpdir
+    std::int32_t flags = 0;                // 0x520 fs_flags
+    std::int32_t contig_sum_size = 0;      // 0x524 fs_contigsumsize
+
+    static constexpr int direct_blocks = 12;     // NDADDR
+    static constexpr int dir_block_size = 512;   // DIRBLKSIZ
+
     bool valid() const { return magic == magic_value; }
     std::int64_t free_space_bytes() const {
         return free_blocks * block_size + free_fragments * fragment_size;

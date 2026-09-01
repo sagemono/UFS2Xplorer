@@ -19,6 +19,8 @@ constexpr std::size_t kNdblk = 0x14;
 constexpr std::size_t kNbfree = 0x1C;
 constexpr std::size_t kNifree = 0x20;
 constexpr std::size_t kNffree = 0x24;
+constexpr std::size_t kRotor = 0x28;  // cg_rotor  (wholeblock allocation)
+constexpr std::size_t kFrotor = 0x2C; // cg_frotor (fragment searches)
 constexpr std::size_t kIrotor = 0x30;
 constexpr std::size_t kFrsum = 0x34; // cg_frsum[fragsPerBlock]
 constexpr std::size_t kIusedoff = 0x5C;
@@ -79,6 +81,8 @@ cylinder_group& ufs2_writer::read_cylinder_group(int cg_number) {
     cg.free_inodes = get_i32(cg.raw_data, kNifree);
     cg.inodes_used_offset = get_i32(cg.raw_data, kIusedoff);
     cg.free_blocks_offset = get_i32(cg.raw_data, kFreeoff);
+    cg.block_rotor = get_i32(cg.raw_data, kRotor);
+    cg.frag_rotor = get_i32(cg.raw_data, kFrotor);
     cg.inode_rotor = get_i32(cg.raw_data, kIrotor);
     cg.inited_iblk = get_i32(cg.raw_data, kInitediblk);
 
@@ -102,6 +106,48 @@ std::array<std::int64_t, 5> ufs2_writer::compute_cg_summary(const cylinder_group
 
 void ufs2_writer::write_cylinder_group(cylinder_group& cg) {
     dirty_cgs_.insert(cg.number);
+    refresh_policy_summary(cg);
+}
+
+void ufs2_writer::refresh_policy_summary(const cylinder_group& cg) {
+    if (!use_lv2_policy_) return;
+    if (cg.number < 0 || static_cast<std::size_t>(cg.number) >= policy_.cs.size()) return;
+    cg_summary& s = policy_.cs[static_cast<std::size_t>(cg.number)];
+    s.num_dirs = get_i32(cg.raw_data, 0x18);
+    s.free_blocks = get_i32(cg.raw_data, 0x1C);
+    s.free_inodes = get_i32(cg.raw_data, 0x20);
+    s.free_fragments = get_i32(cg.raw_data, 0x24);
+}
+
+bool ufs2_writer::load_policy_context() {
+    policy_.reset(sb_);
+    const int ncg = sb_.cylinder_groups;
+    if (ncg <= 0 || sb_.cs_address <= 0 || sb_.cs_size <= 0 || sb_.fragment_size <= 0) return false;
+
+    const std::size_t want = static_cast<std::size_t>(ncg) * 16;
+    if (static_cast<std::size_t>(sb_.cs_size) < want) return false;
+    std::vector<std::byte> raw;
+    try {
+        raw = disk_.read_bytes(fs_.partition_offset_bytes() + static_cast<std::uint64_t>(sb_.cs_address) * sb_.fragment_size, want);
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (raw.size() < want) return false;
+    for (int i = 0; i < ncg; ++i) {
+        const std::size_t o = static_cast<std::size_t>(i) * 16;
+        cg_summary& s = policy_.cs[static_cast<std::size_t>(i)];
+        s.num_dirs = get_i32(raw, o + 0);
+        s.free_blocks = get_i32(raw, o + 4);
+        s.free_inodes = get_i32(raw, o + 8);
+        s.free_fragments = get_i32(raw, o + 12);
+    }
+    return true;
+}
+
+bool ufs2_writer::set_lv2_policy(bool on) {
+    if (!on) { use_lv2_policy_ = false; return false; }
+    use_lv2_policy_ = load_policy_context();
+    return use_lv2_policy_;
 }
 
 void ufs2_writer::flush_dirty_cgs() {
@@ -163,15 +209,55 @@ std::pair<std::int64_t, int> ufs2_writer::find_free_block_run(cylinder_group& cg
     return {-1, 0};
 }
 
-std::int64_t ufs2_writer::find_free_fragments(cylinder_group& cg, int count) {
+int ufs2_writer::rotor_start_for(const cylinder_group& cg, int count) const {
+    const int r = (count >= frags_per_block()) ? cg.block_rotor : cg.frag_rotor;
+    const int lo = static_cast<int>(sb_.data_block_offset);
+    const int fpg = static_cast<int>(sb_.frags_per_group);
+    if (r < lo || r >= fpg) return lo;
+    return r;
+}
+
+void ufs2_writer::store_rotor(cylinder_group& cg, int count, int frag) {
+    if (count >= frags_per_block()) {
+        cg.block_rotor = frag;
+        put_i32(cg.raw_data, kRotor, frag);
+    } else {
+        cg.frag_rotor = frag;
+        put_i32(cg.raw_data, kFrotor, frag);
+    }
+}
+
+int ufs2_writer::find_free_inode_rotor(cylinder_group& cg) {
+    const int ipg = static_cast<int>(sb_.inodes_per_group);
+    int start = cg.inode_rotor;
+    if (start < 0 || start >= ipg) start = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        const int from = pass == 0 ? start : 0;
+        const int to = pass == 0 ? ipg : start;
+        for (int i = from; i < to; ++i) {
+            const std::size_t byte_idx = static_cast<std::size_t>(cg.inodes_used_offset) + i / 8;
+            if (byte_idx < cg.raw_data.size() && !bit_set(cg.raw_data, byte_idx, i % 8)) {
+                cg.inode_rotor = i;
+                put_i32(cg.raw_data, kIrotor, i);
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+std::int64_t ufs2_writer::find_free_fragments(cylinder_group& cg, int count, int pref_local) {
     const int fpg = static_cast<int>(sb_.frags_per_group);
     const int bitmap = cg.free_blocks_offset;
     const int fpb = frags_per_block();
     const bool require_align = count >= fpb;
 
     int start_from = static_cast<int>(sb_.data_block_offset);
-    if (auto it = cg_search_cursor_.find(cg.number); it != cg_search_cursor_.end() && it->second > start_from)
+    if (use_lv2_policy_) {
+        start_from = (pref_local >= static_cast<int>(sb_.data_block_offset)) ? (pref_local / 8) * 8 : rotor_start_for(cg, count);
+    } else if (auto it = cg_search_cursor_.find(cg.number); it != cg_search_cursor_.end() && it->second > start_from) {
         start_from = it->second;
+    }
     if (require_align && start_from % fpb != 0) start_from = (start_from / fpb + 1) * fpb;
 
     int consecutive = 0, start_frag = -1;
@@ -191,6 +277,43 @@ std::int64_t ufs2_writer::find_free_fragments(cylinder_group& cg, int count) {
             }
             if (++consecutive == count) {
                 cg_search_cursor_[cg.number] = start_frag + count;
+                if (use_lv2_policy_) store_rotor(cg, count, start_frag);
+                return start_frag;
+            }
+        } else {
+            consecutive = 0;
+            if (require_align) f = (f / fpb + 1) * fpb - 1;
+        }
+    }
+    if (use_lv2_policy_ && start_from > static_cast<int>(sb_.data_block_offset)) {
+        const int save = cg.block_rotor, savef = cg.frag_rotor;
+        cg.block_rotor = cg.frag_rotor = static_cast<int>(sb_.data_block_offset);
+        const std::int64_t r = find_free_fragments_scan(cg, count, static_cast<int>(sb_.data_block_offset), start_from);
+        if (r < 0) { cg.block_rotor = save; cg.frag_rotor = savef; }
+        return r;
+    }
+    return -1;
+}
+
+std::int64_t ufs2_writer::find_free_fragments_scan(cylinder_group& cg, int count, int from, int to) {
+    const int fpb = frags_per_block();
+    const int bitmap = cg.free_blocks_offset;
+    const bool require_align = count >= fpb;
+    int start = from;
+    if (require_align && start % fpb != 0) start = (start / fpb + 1) * fpb;
+    int consecutive = 0, start_frag = -1;
+    for (int f = start; f < to; ++f) {
+        const bool is_free = bit_set(cg.raw_data, bitmap + f / 8, f % 8);
+        const std::int64_t global = static_cast<std::int64_t>(cg.number) * sb_.frags_per_group + f;
+        if (is_free && protected_fragments_.count(global) == 0) {
+            if (consecutive == 0) {
+                if (require_align && f % fpb != 0) { f = (f / fpb + 1) * fpb - 1; continue; }
+                if (!require_align && (f % fpb) + count > fpb) { f = (f / fpb + 1) * fpb - 1; continue; }
+                start_frag = f;
+            }
+            if (++consecutive == count) {
+                cg_search_cursor_[cg.number] = start_frag + count;
+                store_rotor(cg, count, start_frag);
                 return start_frag;
             }
         } else {
@@ -213,6 +336,10 @@ void ufs2_writer::mark_inode_used(cylinder_group& cg, int inode_idx) {
         const int new_blocks = new_inited / inopb;
         if (new_blocks - old_blocks > 0 && new_blocks - old_blocks < 1000) {
             std::vector<std::byte> zeros(static_cast<std::size_t>(sb_.block_size), std::byte{0});
+            if (use_lv2_policy_) {
+                for (std::size_t o = 0; o + superblock::inode_size <= zeros.size(); o += superblock::inode_size)
+                    ps3hdd::write_be_u32(zeros.data() + o + 0x50, (next_gen() >> 1) + 1);
+            }
             const std::int64_t cg_start = static_cast<std::int64_t>(cg.number) * sb_.frags_per_group;
             for (int blk = old_blocks; blk < new_blocks; ++blk) {
                 const std::int64_t frag = cg_start + sb_.inode_block_offset +
@@ -258,16 +385,39 @@ void ufs2_writer::update_frsum(cylinder_group& cg, const std::vector<int>& old_r
             put_i32(cg.raw_data, kFrsum + r * 4, get_i32(cg.raw_data, kFrsum + r * 4) + 1);
 }
 
-void ufs2_writer::update_cluster_bitmap(cylinder_group& cg, int block_idx, int /*fpb*/) {
+void ufs2_writer::cluster_acct(cylinder_group& cg, int blkno, int cnt) {
+    const int contigsum = sb_.contig_sum_size;
+    if (contigsum <= 0) return;
     const int clusteroff = get_i32(cg.raw_data, kClusteroff);
     const int clustersumoff = get_i32(cg.raw_data, kClustersumoff);
     const int nclusterblks = get_i32(cg.raw_data, kNclusterblks);
     if (clusteroff == 0 || clustersumoff == 0 || nclusterblks == 0) return;
-    if (block_idx < 0 || block_idx >= nclusterblks) return;
+    if (blkno < 0 || blkno >= nclusterblks) return;
 
-    const std::size_t byte_idx = static_cast<std::size_t>(clusteroff) + block_idx / 8;
-    if (byte_idx < cg.raw_data.size())
-        cg.raw_data[byte_idx] &= static_cast<std::byte>(~(1 << (block_idx % 8)));
+    auto isset = [&](int i) {
+        const std::size_t b = static_cast<std::size_t>(clusteroff) + i / 8;
+        return b < cg.raw_data.size() && ((std::to_integer<int>(cg.raw_data[b]) >> (i % 8)) & 1);
+    };
+    const std::size_t bit_byte = static_cast<std::size_t>(clusteroff) + blkno / 8;
+    if (bit_byte >= cg.raw_data.size()) return;
+    if (cnt > 0) cg.raw_data[bit_byte] |= static_cast<std::byte>(1 << (blkno % 8));
+    else         cg.raw_data[bit_byte] &= static_cast<std::byte>(~(1 << (blkno % 8)));
+
+    int end = blkno + 1 + contigsum;
+    if (end > nclusterblks) end = nclusterblks;
+    int forw = 0;
+    for (int i = blkno + 1; i < end && isset(i); ++i) ++forw;
+    int back = 0;
+    for (int i = blkno - 1; i >= 0 && i > blkno - 1 - contigsum && isset(i); --i) ++back;
+
+    auto sum_at = [&](int i) { return get_i32(cg.raw_data, static_cast<std::size_t>(clustersumoff) + 4 * i); };
+    auto set_sum = [&](int i, std::int32_t v) { put_i32(cg.raw_data, static_cast<std::size_t>(clustersumoff) + 4 * i, v); };
+
+    int i = back + forw + 1;
+    if (i > contigsum) i = contigsum;
+    set_sum(i, sum_at(i) + cnt);
+    if (back > 0) set_sum(back, sum_at(back) - cnt);
+    if (forw > 0) set_sum(forw, sum_at(forw) - cnt);
 }
 
 void ufs2_writer::mark_fragments_used(cylinder_group& cg, int start_frag, int count) {
@@ -292,7 +442,7 @@ void ufs2_writer::mark_fragments_used(cylinder_group& cg, int start_frag, int co
         } else if (old_free != fpb) {
             put_i32(cg.raw_data, kNffree, get_i32(cg.raw_data, kNffree) - (old_free - new_free));
         }
-        update_cluster_bitmap(cg, block_start / fpb, fpb);
+        if (old_free == fpb && new_free != fpb) cluster_acct(cg, block_start / fpb, -1);
         f = seg_end;
     }
 }
@@ -319,7 +469,7 @@ void ufs2_writer::mark_fragment_used(cylinder_group& cg, int frag_idx) {
         put_i32(cg.raw_data, kNffree, get_i32(cg.raw_data, kNffree) - 1);
     }
 
-    update_cluster_bitmap(cg, frag_idx / fpb, fpb);
+    if (old_free == fpb && new_free != fpb) cluster_acct(cg, frag_idx / fpb, -1);
 }
 
 namespace {
@@ -532,11 +682,53 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
             }
             return;
         } catch (const std::runtime_error&) {
-            if (extent < block_bytes)
-                throw std::runtime_error("directory fragment full: fragment extension not implemented");
+            if (extent < block_bytes) {
+                const int ofrags = static_cast<int>(extent / sb_.fragment_size);
+                const int nfrags = std::min(ofrags + 1, frags_per_block());
+                if (!frag_extend(frag, ofrags, nfrags))
+                    throw std::runtime_error("directory fragment full and cannot be extended in place");
+
+                const std::int64_t new_extent = static_cast<std::int64_t>(nfrags) * sb_.fragment_size;
+                std::vector<std::byte> grown(static_cast<std::size_t>(new_extent), std::byte{0});
+                std::memcpy(grown.data(), block.data(), block.size());
+                for (std::int64_t sec = extent; sec + 6 <= new_extent; sec += superblock::dir_block_size)
+                    put_u16(grown, static_cast<std::size_t>(sec) + 4, superblock::dir_block_size);
+
+                auto updated = add_entry_to_directory_block(grown, child_inode, name, dir_entry_type);
+                write_data_block(frag, updated);
+                put_be64(pinode, 0x10, static_cast<std::uint64_t>(block_start + dir_block_used_bytes(updated)));
+                put_be64(pinode, 0x18,
+                         ps3hdd::read_be_u64(pinode.data() + 0x18) +
+                             static_cast<std::uint64_t>(nfrags - ofrags) * sb_.fragment_size / 512);
+                save_inode();
+                return;
+            }
         }
     }
     throw std::runtime_error("directory too large: needs indirect directory blocks (not yet supported)");
+}
+
+bool ufs2_writer::frag_extend(std::int64_t abs_frag, int ofrags, int nfrags) {
+    const int fpb = frags_per_block();
+    const int fpg = static_cast<int>(sb_.frags_per_group);
+    if (nfrags <= ofrags || nfrags > fpb || abs_frag <= 0 || fpg <= 0) return false;
+
+    const int cgn = static_cast<int>(abs_frag / fpg);
+    const int bno = static_cast<int>(abs_frag % fpg);
+    if (cgn < 0 || cgn >= sb_.cylinder_groups) return false;
+    if ((bno % fpb) + nfrags > fpb) return false;
+
+    auto& cg = read_cylinder_group(cgn);
+    if (cg.magic != cylinder_group::magic_value) return false;
+    for (int i = ofrags; i < nfrags; ++i) {
+        const int f = bno + i;
+        if (f < 0 || f >= fpg) return false;
+        if (!bit_set(cg.raw_data, static_cast<std::size_t>(cg.free_blocks_offset) + f / 8, f % 8)) return false;
+        if (protected_fragments_.count(static_cast<std::int64_t>(cgn) * fpg + f)) return false;
+    }
+    mark_fragments_used(cg, bno + ofrags, nfrags - ofrags);
+    write_cylinder_group(cg);
+    return true;
 }
 
 std::int64_t ufs2_writer::alloc_run(int count, cylinder_group*& block_cg) {
@@ -556,12 +748,134 @@ std::int64_t ufs2_writer::alloc_run(int count, cylinder_group*& block_cg) {
     return static_cast<std::int64_t>(block_cg->number) * sb_.frags_per_group + frag;
 }
 
+bool ufs2_writer::fragments_free_at(const cylinder_group& cg, int start, int count) const {
+    const int fpg = static_cast<int>(sb_.frags_per_group);
+    const int fpb = frags_per_block();
+    if (start < static_cast<int>(sb_.data_block_offset) || start + count > fpg) return false;
+
+    if (count >= fpb) {
+        if (start % fpb != 0) return false;
+    } else if ((start % fpb) + count > fpb) {
+        return false;
+    }
+    for (int i = 0; i < count; ++i) {
+        const int f = start + i;
+        if (!bit_set(cg.raw_data, static_cast<std::size_t>(cg.free_blocks_offset) + f / 8, f % 8)) return false;
+        const std::int64_t global = static_cast<std::int64_t>(cg.number) * sb_.frags_per_group + f;
+        if (protected_fragments_.count(global)) return false;
+    }
+    return true;
+}
+
+std::int64_t ufs2_writer::alloc_run_pref(int count, std::int64_t pref, cylinder_group*& block_cg) {
+    const int fpg = static_cast<int>(sb_.frags_per_group);
+    const int ncg = sb_.cylinder_groups;
+    if (fpg <= 0 || ncg <= 0) return alloc_run(count, block_cg);
+
+    const int pref_cg = pref > 0 ? static_cast<int>((pref / fpg) % ncg) : (block_cg ? block_cg->number : 0);
+
+    cylinder_group* found = nullptr;
+    std::int64_t found_frag = -1;
+    const std::int64_t got = ffs_hashalloc(policy_, pref_cg, pref, [&](int cg, std::int64_t p) -> std::int64_t {
+        auto& c = read_cylinder_group(cg);
+        if (c.magic != cylinder_group::magic_value) return 0;
+        if (p > 0 && (p / fpg) == cg) {
+            const int local = static_cast<int>(p % fpg);
+            if (fragments_free_at(c, local, count)) {
+                found = &c;
+                found_frag = local;
+                return static_cast<std::int64_t>(cg) * fpg + local;
+            }
+        }
+        const int hint = (p > 0 && (p / fpg) == cg) ? static_cast<int>(p % fpg) : -1;
+        const std::int64_t f = find_free_fragments(c, count, hint);
+        if (f < 0) return 0;
+        found = &c;
+        found_frag = f;
+        return static_cast<std::int64_t>(cg) * fpg + f;
+    });
+
+    if (got <= 0 || !found) throw std::runtime_error("disk full: no free space in any cylinder group!");
+    block_cg = found;
+    mark_fragments_used(*found, static_cast<int>(found_frag), count);
+    write_cylinder_group(*found);
+    return got;
+}
+
+int ufs2_writer::repair_used_but_free(const std::vector<std::int64_t>& frags) {
+    const int fpg = static_cast<int>(sb_.frags_per_group);
+    if (fpg <= 0) return 0;
+    int fixed = 0;
+    for (const std::int64_t abs : frags) {
+        if (abs < 0) continue;
+        const int cgn = static_cast<int>(abs / fpg);
+        const int idx = static_cast<int>(abs % fpg);
+        if (cgn < 0 || cgn >= sb_.cylinder_groups) continue;
+        auto& cg = read_cylinder_group(cgn);
+        if (cg.magic != cylinder_group::magic_value) continue;
+        if (!bit_set(cg.raw_data, static_cast<std::size_t>(cg.free_blocks_offset) + idx / 8, idx % 8))
+            continue;
+        mark_fragment_used(cg, idx);
+        write_cylinder_group(cg);
+        ++fixed;
+    }
+    return fixed;
+}
+
+int ufs2_writer::reclaim_orphan_inodes(const std::vector<std::int64_t>& inodes,const std::vector<bool>& claimed) {
+    const std::int64_t ipg = sb_.inodes_per_group;
+    if (ipg <= 0) return 0;
+    const int fpb = frags_per_block();
+    int done = 0;
+    auto owned_by_live_file = [&](std::int64_t frag, int count) {
+        for (int k = 0; k < count; ++k) {
+            const std::int64_t f = frag + k;
+            if (f >= 0 && static_cast<std::size_t>(f) < claimed.size() && claimed[static_cast<std::size_t>(f)])
+                return true;
+        }
+        return false;
+    };
+    for (const std::int64_t ino : inodes) {
+        if (ino < 2) continue; // 0 and 1 are reserved
+        inode in;
+        try {
+            in = fs_.read_inode(static_cast<std::uint64_t>(ino));
+        } catch (const std::exception&) {
+            continue;
+        }
+        const int cgn = static_cast<int>(ino / ipg);
+        if (cgn < 0 || cgn >= sb_.cylinder_groups) continue;
+        auto& cg = read_cylinder_group(cgn);
+        if (cg.magic != cylinder_group::magic_value) continue;
+        const int idx = static_cast<int>(ino % ipg);
+        //now skip anything already free ... refreeing would corrupt the counters
+        if (!bit_set(cg.raw_data, static_cast<std::size_t>(cg.inodes_used_offset) + idx / 8, idx % 8))
+            continue;
+
+        for (const auto ptr : fs_.block_pointers(in)) {
+            if (ptr <= 0) continue;
+            if (owned_by_live_file(ptr, fpb)) continue;
+            free_block_run(ptr, fpb);
+        }
+        mark_inode_free(cg, idx);
+        if (in.is_directory())
+            put_i32(cg.raw_data, 0x18, get_i32(cg.raw_data, 0x18) - 1);
+        write_cylinder_group(cg);
+
+        // blank dinode so nothing can mistake it for a live file later]
+        std::vector<std::byte> zero(superblock::inode_size, std::byte{0});
+        write_inode(static_cast<std::uint64_t>(ino), zero);
+        ++done;
+    }
+    return done;
+}
+
 std::uint64_t ufs2_writer::allocate_inode(int start_cg, cylinder_group*& out_cg, int& out_idx) {
     const int ncg = sb_.cylinder_groups;
     for (int i = 0; i < ncg; ++i) {
         const int cgi = (start_cg + i) % ncg;
         auto& cg = read_cylinder_group(cgi);
-        const int idx = find_free_inode(cg);
+        const int idx = use_lv2_policy_ ? find_free_inode_rotor(cg) : find_free_inode(cg);
         if (idx >= 0) {
             out_cg = &cg;
             out_idx = idx;
@@ -578,7 +892,41 @@ std::uint64_t ufs2_writer::create_directory(std::uint64_t parent_inode, const st
     const int parent_cg = static_cast<int>(parent_inode / sb_.inodes_per_group);
     cylinder_group* icg = nullptr;
     int idx = 0;
-    const std::uint64_t new_inode = allocate_inode(parent_cg, icg, idx);
+    std::uint64_t new_inode = 0;
+
+    if (use_lv2_policy_) {
+        // lv2 here picks the cylinder group for a new dir with ffs_dirpref, then hands that preference to ffs_hashalloc, which falls back through a quadratic rehash
+        // and finally a full scan. reproducing both is what spreads a games directory tree across groups the way a console written disk looks
+        
+        // !!!DELIBERATE DEVIATION!!! 
+        // the kernel seeds the first level dir branch with arc4random()
+        
+        //now use the writers existing deterministic PRNG instead, so an install is reproducible run to run. 
+        // placement is random on the console by design! so any draw is equally faithful but a fixed one is far easier to diff and to debug 
+        
+        const bool root_child = (parent_inode == ufs2_filesystem::root_inode);
+        const std::int64_t pref_ino = ffs_dirpref(policy_, parent_inode, root_child, next_gen());
+        const int pref_cg = sb_.inodes_per_group > 0 ? static_cast<int>(pref_ino / sb_.inodes_per_group) % std::max(1, sb_.cylinder_groups) : parent_cg;
+        cylinder_group* found = nullptr;
+        int found_idx = -1;
+        const std::int64_t got = ffs_hashalloc(policy_, pref_cg, pref_ino, [&](int cg, std::int64_t) -> std::int64_t {
+            auto& c = read_cylinder_group(cg);
+            if (c.magic != cylinder_group::magic_value) return 0;
+            const int i = find_free_inode_rotor(c);
+            if (i < 0) return 0;
+            found = &c;
+            found_idx = i;
+            // 0 means "nothing here" to hashalloc
+            // inode 0 is reserved so this is safe!
+            return static_cast<std::int64_t>(cg) * sb_.inodes_per_group + i;
+        });
+        if (got <= 0 || !found) throw std::runtime_error("no free inodes on disk");
+        icg = found;
+        idx = found_idx;
+        new_inode = static_cast<std::uint64_t>(got);
+    } else {
+        new_inode = allocate_inode(parent_cg, icg, idx);
+    }
 
     cylinder_group* block_cg = icg;
     const std::int64_t abs_frag = alloc_run(frags_per_block(), block_cg);
@@ -592,6 +940,11 @@ std::uint64_t ufs2_writer::create_directory(std::uint64_t parent_inode, const st
 
     put_i32(icg->raw_data, 0x18, get_i32(icg->raw_data, 0x18) + 1);
     write_cylinder_group(*icg);
+
+    if (use_lv2_policy_) {
+        const std::size_t c = static_cast<std::size_t>(icg->number);
+        if (c < policy_.contig_dirs.size() && policy_.contig_dirs[c] < 255) ++policy_.contig_dirs[c];
+    }
 
     add_entry_to_directory(parent_inode, new_inode, name, DT_DIR);
 
@@ -658,7 +1011,19 @@ std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::str
             frags_this = static_cast<int>((remaining + sb_.fragment_size - 1) / sb_.fragment_size);
             frags_this = std::max(1, std::min(frags_this, fpb));
         }
-        const std::int64_t abs_frag = alloc_run(frags_this, block_cg);
+        std::int64_t abs_frag;
+        if (use_lv2_policy_) {
+            // lv2 asks ffs_blkpref_ufs2 where this block actually wants to go before allocating
+            // indx is the slot within whichever pointer array holds this block: the inode's own 12 direct slots, or a slot inside an indirect block. 
+            // bap[indx-1]
+            // is simply the block allocated just before it in that same array, which is what wmakes the common case a contiguous append
+            const int indx = (b < superblock::direct_blocks) ? static_cast<int>(b) : static_cast<int>((b - superblock::direct_blocks) % ppb);
+            const std::int64_t prev = (indx > 0 && b > 0) ? data_blocks[static_cast<std::size_t>(b - 1)] : 0;
+            const std::int64_t pref = ffs_blkpref_ufs2_prev(policy_, new_inode, b, indx, prev);
+            abs_frag = alloc_run_pref(frags_this, pref, block_cg);
+        } else {
+            abs_frag = alloc_run(frags_this, block_cg);
+        }
 
         const std::size_t wb = static_cast<std::size_t>(frags_this) * sb_.fragment_size;
         if (batch_frag >= 0 && (abs_frag != batch_end || batch.size() + wb > kWriteBatch))
@@ -682,8 +1047,19 @@ std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::str
 
     std::int64_t indirect = 0, double_indirect = 0;
 
+    // an indirect (pointer) block is metadata, not file data! 
+    // The kernel asks blkpref for it too, but passes a null bap.
+    
+    // so there is no predecessor and it falls through to the "own cylinder group / rotor" cases rather than appending..
+    //
+    auto alloc_meta_block = [&](std::int64_t lbn) -> std::int64_t {
+        if (!use_lv2_policy_) return alloc_run(fpb, block_cg);
+        const std::int64_t pref = ffs_blkpref_ufs2_prev(policy_, new_inode, lbn, 0, 0);
+        return alloc_run_pref(fpb, pref, block_cg);
+    };
+
     auto write_pointer_block = [&](std::int64_t base, std::int64_t count) -> std::int64_t {
-        const std::int64_t frag = alloc_run(fpb, block_cg);
+        const std::int64_t frag = alloc_meta_block(base);
         std::vector<std::byte> blk(static_cast<std::size_t>(sb_.block_size), std::byte{0});
         for (std::int64_t j = 0; j < count; ++j)
             put_be64(blk, static_cast<std::size_t>(j) * 8, static_cast<std::uint64_t>(data_blocks[static_cast<std::size_t>(base + j)]));
@@ -705,7 +1081,7 @@ std::uint64_t ufs2_writer::write_file(std::uint64_t parent_inode, const std::str
             const std::int64_t l1_frag = write_pointer_block(base, count);
             put_be64(dbl, static_cast<std::size_t>(l1) * 8, static_cast<std::uint64_t>(l1_frag));
         }
-        double_indirect = alloc_run(fpb, block_cg);
+        double_indirect = alloc_meta_block(12 + ppb);
         write_data_block(double_indirect, dbl);
     }
 
@@ -815,6 +1191,44 @@ int ufs2_writer::repair_free_counts(const std::function<void(int, int)>& progres
                     put_i32(cg.raw_data, 0x34 + i * 4, static_cast<std::int32_t>(frsum[i]));
                     changed = true;
                 }
+
+            const int contigsum = sb_.contig_sum_size;
+            const int clusteroff = get_i32(cg.raw_data, kClusteroff);
+            const int clustersumoff = get_i32(cg.raw_data, kClustersumoff);
+            const int nclusterblks = get_i32(cg.raw_data, kNclusterblks);
+            if (contigsum > 0 && clusteroff > 0 && clustersumoff > 0 && nclusterblks > 0) {
+                std::vector<std::uint8_t> want(static_cast<std::size_t>(nclusterblks), 0);
+                for (int b = 0; b < nclusterblks; ++b) {
+                    bool all_free = true;
+                    for (int k = 0; k < fpb && all_free; ++k)
+                        if (!bit(freeoff, b * fpb + k)) all_free = false;
+                    want[static_cast<std::size_t>(b)] = all_free ? 1 : 0;
+                }
+                for (int b = 0; b < nclusterblks; ++b) {
+                    const std::size_t byte = static_cast<std::size_t>(clusteroff) + b / 8;
+                    if (byte >= cg.raw_data.size()) break;
+                    const bool now = (std::to_integer<int>(cg.raw_data[byte]) >> (b % 8)) & 1;
+                    if (now == (want[static_cast<std::size_t>(b)] != 0)) continue;
+                    if (want[static_cast<std::size_t>(b)])
+                        cg.raw_data[byte] |= static_cast<std::byte>(1 << (b % 8));
+                    else
+                        cg.raw_data[byte] &= static_cast<std::byte>(~(1 << (b % 8)));
+                    changed = true;
+                }
+                std::vector<std::int32_t> csum(static_cast<std::size_t>(contigsum) + 1, 0);
+                int run = 0;
+                for (int b = 0; b <= nclusterblks; ++b) {
+                    const bool free_here = b < nclusterblks && want[static_cast<std::size_t>(b)];
+                    if (free_here) { ++run; continue; }
+                    if (run > 0) ++csum[static_cast<std::size_t>(std::min(run, contigsum))];
+                    run = 0;
+                }
+                for (int i = 1; i <= contigsum; ++i)
+                    if (get_i32(cg.raw_data, static_cast<std::size_t>(clustersumoff) + 4 * i) != csum[static_cast<std::size_t>(i)]) {
+                        put_i32(cg.raw_data, static_cast<std::size_t>(clustersumoff) + 4 * i, csum[static_cast<std::size_t>(i)]);
+                        changed = true;
+                    }
+            }
             if (changed) {
                 cg.free_blocks = get_i32(cg.raw_data, 0x1C);
                 cg.free_inodes = get_i32(cg.raw_data, 0x20);
@@ -847,7 +1261,7 @@ void ufs2_writer::mark_fragment_free(cylinder_group& cg, int frag_idx) {
     } else {
         put_i32(cg.raw_data, 0x24, get_i32(cg.raw_data, 0x24) + 1);
     }
-    update_cluster_bitmap(cg, frag_idx / fpb, fpb);
+    if (old_free != fpb && new_free == fpb) cluster_acct(cg, frag_idx / fpb, +1);
 }
 
 void ufs2_writer::mark_fragments_free(cylinder_group& cg, int start_frag, int count) {
@@ -872,7 +1286,7 @@ void ufs2_writer::mark_fragments_free(cylinder_group& cg, int start_frag, int co
         } else if (new_free != fpb) {
             put_i32(cg.raw_data, 0x24, get_i32(cg.raw_data, 0x24) + (new_free - old_free));
         }
-        update_cluster_bitmap(cg, block_start / fpb, fpb);
+        if (old_free != fpb && new_free == fpb) cluster_acct(cg, block_start / fpb, +1);
         f = seg_end;
     }
 }
@@ -987,6 +1401,47 @@ std::uint64_t ufs2_writer::remove_entry_from_directory(std::uint64_t parent_inod
     throw std::runtime_error("entry not found in directory");
 }
 
+void ufs2_writer::truncate_directory_tail(std::uint64_t dir_inode) {
+    if (!use_lv2_policy_) return;
+    const int fpb = frags_per_block();
+    const std::size_t block_bytes = static_cast<std::size_t>(sb_.block_size);
+
+    const std::int64_t pg = static_cast<std::int64_t>(dir_inode) / sb_.inodes_per_group;
+    const std::int64_t pidx = static_cast<std::int64_t>(dir_inode) % sb_.inodes_per_group;
+    const std::uint64_t ioff = fs_.partition_offset_bytes() +
+        static_cast<std::uint64_t>(pg) * sb_.frags_per_group * sb_.fragment_size +
+        sb_.inode_block_offset * sb_.fragment_size + static_cast<std::uint64_t>(pidx) * superblock::inode_size;
+    auto raw = disk_.read_bytes(ioff, superblock::inode_size);
+
+    auto block_has_entries = [&](std::int64_t frag, std::size_t extent) {
+        auto blk = disk_.read_bytes(fs_.partition_offset_bytes() + static_cast<std::uint64_t>(frag) * sb_.fragment_size, extent);
+        for (std::size_t o = 0; o + 8 <= blk.size();) {
+            const std::uint32_t ino = ps3hdd::read_be_u32(blk.data() + o);
+            const std::uint16_t rec = ps3hdd::read_be_u16(blk.data() + o + 4);
+            if (rec == 0) break;
+            if (ino != 0) return true;
+            o += rec;
+        }
+        return false;
+    };
+
+    bool changed = false;
+
+    for (int i = 11; i >= 1; --i) {
+        const std::int64_t frag = static_cast<std::int64_t>(ps3hdd::read_be_u64(raw.data() + 0x70 + i * 8));
+        if (frag == 0) continue;
+        if (block_has_entries(frag, block_bytes)) break;
+        free_block_run(frag, fpb);
+        ps3hdd::write_be_u64(raw.data() + 0x70 + i * 8, 0);
+        const std::uint64_t blocks = ps3hdd::read_be_u64(raw.data() + 0x18);
+        const std::uint64_t used = static_cast<std::uint64_t>(block_bytes) / 512;
+        ps3hdd::write_be_u64(raw.data() + 0x18, blocks > used ? blocks - used : 0);
+        ps3hdd::write_be_u64(raw.data() + 0x10, static_cast<std::uint64_t>(i) * block_bytes);
+        changed = true;
+    }
+    if (changed) write_inode(dir_inode, raw);
+}
+
 void ufs2_writer::delete_file(std::uint64_t parent_inode, const std::string& name) {
     const std::uint64_t child = remove_entry_from_directory(parent_inode, name);
     const auto in = fs_.read_inode(child);
@@ -998,6 +1453,7 @@ void ufs2_writer::delete_file(std::uint64_t parent_inode, const std::string& nam
     auto& cg = read_cylinder_group(cg_num);
     mark_inode_free(cg, static_cast<int>(child % sb_.inodes_per_group));
     write_cylinder_group(cg);
+    truncate_directory_tail(parent_inode);
 }
 
 void ufs2_writer::delete_directory(std::uint64_t parent_inode, const std::string& name) {

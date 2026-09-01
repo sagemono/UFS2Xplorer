@@ -65,6 +65,23 @@ superblock superblock::parse(std::span<const std::byte> data) {
     sb.free_inodes = read_be_i64(data, 0x400);        // cs_nifree
     sb.free_fragments = read_be_i64(data, 0x408);     // cs_nffree
 
+    sb.frag = read_be_i32(data, 0x38);                 // fs_frag
+    sb.min_free_percent = read_be_i32(data, 0x3C);     // fs_minfree
+    sb.frag_shift = read_be_i32(data, 0x54);           // fs_fshift
+    sb.max_blocks_per_group = read_be_i32(data, 0x5C); // fs_maxbpg
+    sb.frag_to_block_shift = read_be_i32(data, 0x60);  // fs_fragshift
+    sb.frag_to_disk_shift = read_be_i32(data, 0x64);   // fs_fsbtodb
+    sb.sb_size = read_be_i32(data, 0x68);              // fs_sbsize
+    sb.optim = read_be_i32(data, 0x80);                // fs_optim
+    sb.indirect_per_block = read_be_i32(data, 0x74);   // fs_nindir
+    sb.cs_size = read_be_i32(data, 0x9C);              // fs_cssize
+    sb.sb_location = read_be_i64(data, 0x3E8);         // fs_sblockloc
+    sb.cs_address = read_be_i64(data, 0x448);          // fs_csaddr
+    sb.avg_file_size = read_be_i32(data, 0x4AC);       // fs_avgfilesize
+    sb.avg_files_per_dir = read_be_i32(data, 0x4B0);   // fs_avgfpdir
+    sb.flags = read_be_i32(data, 0x520);               // fs_flags
+    sb.contig_sum_size = read_be_i32(data, 0x524);     // fs_contigsumsize
+
     sb.volume_name = read_fixed_cstr(data, 0x480, 32); // fs_volname
     return sb;
 }

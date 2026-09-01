@@ -204,8 +204,8 @@ void import_path(fs::ufs2_filesystem& ufs, fs::ufs2_writer& writer, const QStrin
 
 bool consistency_ok(fs::ufs2_filesystem& check, disk::disk_source& dec, QString& msg) {
     const auto rep = fs::check_consistency(check, dec);
-    msg = QStringLiteral("consistency: cross-links=%1 out-of-range=%2 used-but-free=%3 summary-mismatches=%4").arg(rep.cross_links).arg(rep.out_of_range).arg(rep.used_but_free).arg(rep.summary_mismatches);
-    return rep.clean();
+    msg = QStringLiteral("consistency: ") + QString::fromStdString(rep.summary_line());
+    return rep.safe_to_write();
 }
 
 bool consistency_ok(const app::gameos_mount& m, QString& msg) {
@@ -498,15 +498,33 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
 void worker::run_consistency(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     const auto rep = fs::check_consistency(ufs, *m.decrypted);
     for (const auto& f : rep.findings) emit progress(QString::fromStdString(f), -1);
-    const QString msg =
-        QStringLiteral("cross-links=%1 out-of-range=%2 used-but-free=%3 summary-mismatches=%4").arg(rep.cross_links).arg(rep.out_of_range).arg(rep.used_but_free).arg(rep.summary_mismatches);
-    emit finished(rep.clean(), msg + (rep.clean() ? QStringLiteral("  -> CLEAN") : QStringLiteral("  -> INCONSISTENT")));
+    const QString msg = QString::fromStdString(rep.summary_line());
+    QString verdict;
+    if (rep.structurally_damaged())
+        verdict = QStringLiteral("  -> DAMAGED: a fragment is claimed twice or points outside the filesystem. Repair cannot fix this without losing data; restore the disk on the console.");
+    else if (rep.repairable())
+        verdict = QStringLiteral("  -> INCONSISTENT, but repairable: press Repair Filesystem.");
+    else if (rep.orphan_inodes > 0)
+        verdict = QStringLiteral("  -> CLEAN, with %1 orphan inode(s) leaking space. ps3hdd_fsck --reclaim-orphans recovers the space.").arg(rep.orphan_inodes);
+    else
+        verdict = QStringLiteral("  -> CLEAN");
+    emit finished(rep.safe_to_write(), msg + verdict);
     return;
 }
 
 void worker::run_repair_counts(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     fs::ufs2_writer writer(ufs, *m.decrypted);
-    emit progress(QStringLiteral("Recomputing free-space counts from the bitmaps ..."), 0);
+    emit progress(QStringLiteral("Scanning the tree ..."), -1);
+    const auto pre = fs::check_consistency(ufs, *m.decrypted);
+    if (pre.structurally_damaged()) {
+        emit finished(false, QStringLiteral("Refusing to repair: %1. A fragment is claimed twice or points outside the filesystem, which repair cannot resolve without discarding data. Restore the disk on the console.").arg(QString::fromStdString(pre.summary_line())));
+        return;
+    }
+    if (!pre.used_but_free_frags.empty()) {
+        emit progress(QStringLiteral("Marking %1 in-use fragment(s) back as allocated ...").arg(pre.used_but_free_frags.size()), -1);
+        writer.repair_used_but_free(pre.used_but_free_frags);
+    }
+    emit progress(QStringLiteral("Rebuilding free counts and cluster maps from the bitmaps ..."), 0);
     const int fixed = writer.repair_free_counts([this](int done, int total) {
         emit progress(QStringLiteral("Repairing cylinder group %1/%2").arg(done).arg(total), total > 0 ? static_cast<int>(100LL * done / total) : -1);
     });
@@ -594,16 +612,15 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
         return fs::check_consistency(c, *m.decrypted);
     };
     auto rep = recheck();
-    if (!rep.clean() && rep.cross_links == 0 && rep.out_of_range == 0 &&
-        rep.used_but_free == 0 && rep.summary_mismatches > 0) {
-        emit progress(QStringLiteral("Auto-repairing free-space counts (%1 summary-mismatch(es)) ...").arg(rep.summary_mismatches), -1);
+    if (!rep.structurally_damaged() && rep.repairable()) {
+        emit progress(QStringLiteral("Auto-repairing filesystem accounting (%1) ...").arg(QString::fromStdString(rep.summary_line())), -1);
+        if (!rep.used_but_free_frags.empty()) writer.repair_used_but_free(rep.used_but_free_frags);
         const int fixed = writer.repair_free_counts({});
         emit progress(QStringLiteral("Repaired %1 cylinder group(s).").arg(fixed), -1);
         rep = recheck();
     }
-    const QString msg =
-        QStringLiteral("consistency: cross-links=%1 out-of-range=%2 used-but-free=%3 summary-mismatches=%4").arg(rep.cross_links).arg(rep.out_of_range).arg(rep.used_but_free).arg(rep.summary_mismatches);
-    if (!rep.clean()) {
+    const QString msg = QStringLiteral("consistency: ") + QString::fromStdString(rep.summary_line());
+    if (!rep.safe_to_write()) {
         emit finished(false, QStringLiteral("Installed to %1 BUT %2 - do NOT boot; restore the disk.").arg(QString::fromStdString(path), msg));
         return;
     }

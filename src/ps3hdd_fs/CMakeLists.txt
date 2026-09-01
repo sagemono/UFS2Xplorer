@@ -5,6 +5,8 @@ add_library(ps3hdd_fs STATIC
     ufs2_filesystem.h
     ufs2_writer.cpp
     ufs2_writer.h
+    ffs_policy.cpp
+    ffs_policy.h
     ufs2_checker.cpp
     ufs2_checker.h
 )
