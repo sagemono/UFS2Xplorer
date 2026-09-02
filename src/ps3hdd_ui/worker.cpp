@@ -269,6 +269,7 @@ void worker::run() {
         if (job_.file_operation != job::fop_none) { run_file_operation(*m, ufs); return; }
         if (job_.type == job::consistency) { run_consistency(*m, ufs); return; }
         if (job_.type == job::repair_counts) { run_repair_counts(*m, ufs); return; }
+        if (job_.type == job::reclaim_orphans) { run_reclaim_orphans(*m, ufs); return; }
         if (job_.type == job::rebuild_database) { run_rebuild_database(*m, ufs); return; }
         if (job_.type == job::restore_db) { run_restore_db(*m, ufs); return; }
         if (job_.type == job::install_pkg) { run_install_pkg(*m, ufs); return; }
@@ -505,7 +506,7 @@ void worker::run_consistency(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     else if (rep.repairable())
         verdict = QStringLiteral("  -> INCONSISTENT, but repairable: press Repair Filesystem.");
     else if (rep.orphan_inodes > 0)
-        verdict = QStringLiteral("  -> CLEAN, with %1 orphan inode(s) leaking space. ps3hdd_fsck --reclaim-orphans recovers the space.").arg(rep.orphan_inodes);
+        verdict = QStringLiteral("  -> CLEAN, with %1 orphan inode(s) leaking space. These come from deleting a game on the console; press Reclaim Space to recover it.").arg(rep.orphan_inodes);
     else
         verdict = QStringLiteral("  -> CLEAN");
     emit finished(rep.safe_to_write(), msg + verdict);
@@ -531,6 +532,37 @@ void worker::run_repair_counts(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     QString cmsg;
     const bool okc = consistency_ok(m, cmsg);
     emit finished(okc, QStringLiteral("Repaired %1 cylinder group(s).  |  %2").arg(fixed).arg(cmsg));
+    return;
+}
+
+void worker::run_reclaim_orphans(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
+    emit progress(QStringLiteral("Scanning the tree for unreachable inodes ..."), -1);
+    const auto rep = fs::check_consistency(ufs, *m.decrypted);
+    if (rep.structurally_damaged()) {
+        emit finished(false, QStringLiteral("Refusing to reclaim: %1. Restore the disk on the console first.").arg(QString::fromStdString(rep.summary_line())));
+        return;
+    }
+    if (rep.orphan_all_inodes.empty()) {
+        emit finished(true, QStringLiteral("No orphan inodes; nothing to reclaim.  |  %1").arg(QString::fromStdString(rep.summary_line())));
+        return;
+    }
+    emit progress(QStringLiteral("Building the live-block map (%1 orphan inode(s)) ...").arg(rep.orphan_all_inodes.size()), -1);
+    const auto claimed = fs::claimed_fragment_map(ufs, *m.decrypted);
+
+    const std::int64_t before = ufs.sb().free_space_bytes();
+    fs::ufs2_writer writer(ufs, *m.decrypted);
+    emit progress(QStringLiteral("Freeing orphan inodes ..."), -1);
+    const int n = writer.reclaim_orphan_inodes(rep.orphan_all_inodes, claimed);
+    writer.repair_free_counts([this](int done, int total) {
+        emit progress(QStringLiteral("Rebuilding free counts %1/%2").arg(done).arg(total), total > 0 ? static_cast<int>(100LL * done / total) : -1);
+    });
+    writer.update_superblock();
+
+    fs::ufs2_filesystem re(*m.decrypted, m.partition_sector);
+    re.mount();
+    const auto after = fs::check_consistency(re, *m.decrypted);
+    const std::int64_t recovered = re.sb().free_space_bytes() - before;
+    emit finished(after.safe_to_write(), QStringLiteral("Reclaimed %1 orphan inode(s), recovered %2.  |  %3").arg(n).arg(QString::fromStdString(disk::format_size(recovered > 0 ? static_cast<std::uint64_t>(recovered) : 0))).arg(QString::fromStdString(after.summary_line())));
     return;
 }
 
@@ -583,6 +615,12 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     auto pkg = pkg::ps3_pkg_reader::from_file(job_.pkg_path.toStdString());
     emit progress(QStringLiteral("Installing %1 (%2) ...").arg(QString::fromStdString(pkg.content_id()), QString::fromStdString(pkg.title_id())), 0);
     fs::ufs2_writer writer(ufs, *m.decrypted);
+    if (job_.lv2_policy) {
+        if (writer.set_lv2_policy(true))
+            emit progress(QStringLiteral("lv2 1:1 placement policy: ON (ffs_dirpref + ffs_hashalloc)."), -1);
+        else
+            emit progress(QStringLiteral("lv2 1:1 placement policy: REQUESTED BUT UNAVAILABLE - this filesystem has no usable cs summary array; using the normal allocator."), -1);
+    }
     pkg::pkg_installer installer(ufs, writer, pkg);
     xfer_meter meter(*this);
     meter.total = static_cast<qint64>(installer.total_bytes());

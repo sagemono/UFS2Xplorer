@@ -34,6 +34,7 @@
         <file alias="database_save.png">../../resources/icons/database_save.png</file>
         <file alias="drive_add.png">../../resources/icons/drive_add.png</file>
         <file alias="drive_error.png">../../resources/icons/drive_error.png</file>
+        <file alias="drive_delete.png">../../resources/icons/drive_delete.png</file>
         <file alias="drive_go.png">../../resources/icons/drive_go.png</file>
         <file alias="drive_magnify.png">../../resources/icons/drive_magnify.png</file>
         <file alias="eye.png">../../resources/icons/eye.png</file>

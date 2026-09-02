@@ -16,7 +16,7 @@ namespace ps3hdd::fs { class ufs2_filesystem; }
 namespace ps3hdd::ui {
 
 struct job {
-    enum kind { install_pkg, license_rif_only, full_activation, consistency, rebuild_database, restore_db, repair_counts, verify_pkg, license_batch, sync_exdata };
+    enum kind { install_pkg, license_rif_only, full_activation, consistency, rebuild_database, restore_db, repair_counts, reclaim_orphans, verify_pkg, license_batch, sync_exdata };
 
     kind type = consistency;
     QString device;
@@ -32,6 +32,7 @@ struct job {
     bool force = false;
     bool rebuild_db = false;
     bool skip_consistency = false;
+    bool lv2_policy = false;   // Tools > Advanced: lv2 ffs_dirpref/ffs_blkpref placement
     QString host_dir;
 
     quint16 broker_port = 0;
@@ -73,6 +74,7 @@ private:
     void run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
     void run_consistency(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
     void run_repair_counts(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
+    void run_reclaim_orphans(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
     void run_rebuild_database(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
     void run_restore_db(app::gameos_mount& m, fs::ufs2_filesystem& ufs);
     void run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs);

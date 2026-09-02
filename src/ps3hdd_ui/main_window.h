@@ -13,6 +13,7 @@
 #include <QByteArray>
 #include <QHash>
 #include <QList>
+#include <QAction>
 #include <QMainWindow>
 #include <QPersistentModelIndex>
 
@@ -56,6 +57,7 @@ private slots:
     void sync_user_licenses();
     void check_consistency();
     void repair_counts();
+    void reclaim_orphans();
     void show_games();
     void rebuild_database();
     void backup_database();
@@ -156,6 +158,8 @@ private:
     QPushButton* license_btn_ = nullptr;
     QPushButton* fsck_btn_ = nullptr;
     QPushButton* repair_btn_ = nullptr;
+    QPushButton* reclaim_btn_ = nullptr;
+    QAction* lv2_policy_act_ = nullptr;
     QPushButton* games_btn_ = nullptr;
     QPushButton* rebuilddb_btn_ = nullptr;
     QPushButton* backupdb_btn_ = nullptr;

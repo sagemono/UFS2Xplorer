@@ -231,6 +231,26 @@ void main_window::build_menus() {
     tools_menu->addSeparator();
     tools_menu->addAction(QStringLiteral("Export Log..."), this, &main_window::export_log);
 
+    auto* adv_menu = tools_menu->addMenu(QStringLiteral("Advanced"));
+    lv2_policy_act_ = adv_menu->addAction(QStringLiteral("lv2 1:1 placement policy (EXPERIMENTAL)"));
+    lv2_policy_act_->setCheckable(true);
+    lv2_policy_act_->setChecked(app_setting(settings_keys::lv2_policy, false));
+    lv2_policy_act_->setToolTip(QStringLiteral("Place directories and blocks the way lv2's own ffs_dirpref/ffs_blkpref do, instead of our simpler allocator. Only affects new installs."));
+    connect(lv2_policy_act_, &QAction::toggled, this, [this](bool on) {
+        if (on && QMessageBox::warning(this, QStringLiteral("Experimental placement policy"), QStringLiteral("Install new games using lv2's own allocation policy?\n\n"
+                                                      "This reimplements the placement the PS3 kernel itself uses. It has been hardware tested - files read back correctly and installed games launch - but it is NOT yet proven to lay a tree out identically to the console.\n\n"
+                                                      "Use it on a drive you can restore. Run Check Consistency after every install."),
+                                       QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+            QSignalBlocker block(lv2_policy_act_);
+            lv2_policy_act_->setChecked(false);
+            return;
+        }
+        QSettings st(settings_keys::org(), settings_keys::app());
+        st.setValue(settings_keys::lv2_policy, on);
+        status_->setText(on ? QStringLiteral("lv2 1:1 placement policy enabled for new installs.")
+                            : QStringLiteral("lv2 1:1 placement policy disabled; using the normal allocator."));
+    });
+
     auto* help_menu = menuBar()->addMenu(QStringLiteral("&Help"));
     help_menu->addAction(QStringLiteral("About"), this, [this] {
         QMessageBox::about(
@@ -281,6 +301,8 @@ void main_window::build_action_row(QVBoxLayout* root) {
     fsck_btn_ = new QPushButton(QStringLiteral("Check Consistency"));
     repair_btn_ = new QPushButton(QStringLiteral("Repair Filesystem"));
     repair_btn_->setToolTip(QStringLiteral("Rebuild each cylinder group's free-space counts, cluster map and cluster summary from the allocation bitmaps, and mark any in-use fragment that was wrongly flagged free back as allocated. Fixes what an interrupted write leaves behind. Never frees a block a file still references."));
+    reclaim_btn_ = new QPushButton(QStringLiteral("Reclaim Space"));
+    reclaim_btn_->setToolTip(QStringLiteral("Free inodes that are marked in use but are unreachable from the root, and release their data blocks. These are left behind when a game is deleted on the console and the power is cut before it finishes freeing them. Blocks that any reachable file still points at are never touched."));
     games_btn_ = new QPushButton(QStringLiteral("Installed Games"));
     games_btn_->setToolTip(QStringLiteral("List the games under /dev_hdd0/game and uninstall them."));
     rebuilddb_btn_ = new QPushButton(QStringLiteral("Rebuild DB"));
@@ -296,6 +318,7 @@ void main_window::build_action_row(QVBoxLayout* root) {
     license_btn_->setIcon(png("key_add"));
     fsck_btn_->setIcon(png("drive_magnify"));
     repair_btn_->setIcon(png("drive_error"));
+    reclaim_btn_->setIcon(png("drive_delete"));
     games_btn_->setIcon(png("joystick"));
     rebuilddb_btn_->setIcon(png("database_refresh"));
     backupdb_btn_->setIcon(png("database_save"));
@@ -304,6 +327,7 @@ void main_window::build_action_row(QVBoxLayout* root) {
     actions->addWidget(license_btn_);
     actions->addWidget(fsck_btn_);
     actions->addWidget(repair_btn_);
+    actions->addWidget(reclaim_btn_);
     actions->addWidget(games_btn_);
     actions->addWidget(rebuilddb_btn_);
     actions->addWidget(backupdb_btn_);
@@ -462,6 +486,7 @@ void main_window::wire_signals(QPushButton* refresh, QPushButton* open) {
     connect(license_btn_, &QPushButton::clicked, this, &main_window::install_license);
     connect(fsck_btn_, &QPushButton::clicked, this, &main_window::check_consistency);
     connect(repair_btn_, &QPushButton::clicked, this, &main_window::repair_counts);
+    connect(reclaim_btn_, &QPushButton::clicked, this, &main_window::reclaim_orphans);
     connect(games_btn_, &QPushButton::clicked, this, &main_window::show_games);
     connect(rebuilddb_btn_, &QPushButton::clicked, this, &main_window::rebuild_database);
     connect(backupdb_btn_, &QPushButton::clicked, this, &main_window::backup_database);
@@ -849,7 +874,7 @@ void main_window::closeEvent(QCloseEvent* e) {
 }
 
 void main_window::set_disk_actions_enabled(bool on) {
-    for (auto* b : {install_btn_, license_btn_, fsck_btn_, repair_btn_, games_btn_, rebuilddb_btn_, backupdb_btn_, restoredb_btn_})
+    for (auto* b : {install_btn_, license_btn_, fsck_btn_, repair_btn_, reclaim_btn_, games_btn_, rebuilddb_btn_, backupdb_btn_, restoredb_btn_})
         if (b) b->setEnabled(on);
 }
 
@@ -880,6 +905,7 @@ void main_window::start_job(job j, const QString& title) {
 
     const bool is_fileop = j.file_operation != job::fop_none;
     const bool is_pkg_install = j.type == job::install_pkg;
+    if (is_pkg_install) j.lv2_policy = lv2_policy_act_ && lv2_policy_act_->isChecked();
     const bool was_write = j.type != job::consistency && j.type != job::verify_pkg;
     if (was_write && !is_fileop) { writer_.reset(); fs_.reset(); mount_.reset(); raw_.reset(); }
 
@@ -1122,6 +1148,18 @@ void main_window::check_consistency() {
     if (!base_job(j)) return;
     j.type = job::consistency;
     start_job(std::move(j), QStringLiteral("Check Consistency"));
+}
+
+void main_window::reclaim_orphans() {
+    job j;
+    if (!base_job(j)) return;
+    if (QMessageBox::warning(this, QStringLiteral("Reclaim leaked space"), QStringLiteral("Free every inode that is marked in use but cannot be reached from the root directory, and release its data blocks?\n\n"
+                                            "These are normally left behind when a game is deleted on the console and it is powered off before the console finishes freeing them.\n\n"
+                                            "A live-block map is built first, so a block that any reachable file still points at is never freed. Anything the tree walk cannot reach is destroyed, though - run Check Consistency first and read the findings."),
+                             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+    j.type = job::reclaim_orphans;
+    start_job(std::move(j), QStringLiteral("Reclaim Space"));
 }
 
 void main_window::repair_counts() {

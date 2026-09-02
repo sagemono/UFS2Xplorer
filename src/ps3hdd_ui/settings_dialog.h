@@ -15,6 +15,7 @@ inline const QString show_art_panel = QStringLiteral("ui/showArtPanel");
 inline const QString show_tooltips = QStringLiteral("ui/showFolderTips");
 inline const QString show_covers = QStringLiteral("ui/showCoverIcons");
 inline const QString verify_before_install = QStringLiteral("ui/verifyBeforeInstall");
+inline const QString lv2_policy = QStringLiteral("advanced/lv2Policy");
 } // namespace settings_keys
 
 bool app_setting(const QString& key, bool def);
