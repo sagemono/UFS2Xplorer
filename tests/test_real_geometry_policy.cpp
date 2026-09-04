@@ -673,3 +673,133 @@ TEST_CASE("report severity separates damage, repairable drift and leaked inodes"
     CHECK(r.structurally_damaged());
     CHECK_FALSE(r.safe_to_write());
 }
+
+TEST_CASE("a directory boxed in by neighbouring allocations relocates instead of failing", "[realgeom][dir]") {
+    auto disk = trg::build_real_geometry_image();
+    {
+        ufs2_filesystem fs(disk, 0);
+        REQUIRE(fs.mount());
+        ufs2_writer w(fs, disk);
+        trg::bootstrap_root(w);
+        const std::uint64_t dir = w.create_directory(2, "dlc");
+        w.create_directory(dir, "e000");
+        w.update_superblock();
+        w.flush_dirty_cgs();
+    }
+
+    std::int64_t first_block = 0;
+    {
+        ufs2_filesystem b(disk, 0);
+        REQUIRE(b.mount());
+        const auto d = b.resolve_path_to_inode_number("dlc");
+        REQUIRE(d.has_value());
+        const auto ptrs = b.block_pointers(b.read_inode(*d));
+        REQUIRE(!ptrs.empty());
+        first_block = ptrs[0];
+    }
+    {
+        ufs2_filesystem b(disk, 0);
+        REQUIRE(b.mount());
+        const auto d = b.resolve_path_to_inode_number("dlc");
+        REQUIRE(d.has_value());
+        const std::uint64_t ino = *d;
+        const std::uint64_t off =
+            static_cast<std::uint64_t>(ino / trg::kIpg) * trg::kFpg * trg::kFrag +
+            static_cast<std::uint64_t>(trg::kIblkno) * trg::kFrag +
+            static_cast<std::uint64_t>(ino % trg::kIpg) * 256;
+        auto in = disk.read_bytes(off, 256);
+        ps3hdd::write_be_u64(in.data() + 0x18, static_cast<std::uint64_t>(trg::kFrag / 512));
+        disk.write_bytes(off, {in.data(), in.size()});
+    }
+
+    ufs2_filesystem fs2(disk, 0);
+    REQUIRE(fs2.mount());
+    ufs2_writer w2(fs2, disk);
+
+    const std::string pad(190, 'x');
+    for (int i = 1; i < 40; ++i) {
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "e%03d_", i);
+        const auto dir2 = fs2.resolve_path_to_inode_number("dlc");
+        REQUIRE(dir2.has_value());
+        REQUIRE_NOTHROW(w2.create_directory(*dir2, nm + pad));
+    }
+    w2.update_superblock();
+    w2.flush_dirty_cgs();
+
+    ufs2_filesystem re(disk, 0);
+    REQUIRE(re.mount());
+    const auto dino = re.resolve_path_to_inode_number("dlc");
+    REQUIRE(dino.has_value());
+    const auto din = re.read_inode(*dino);
+
+    int count = 0;
+    for (const auto& e : re.read_directory(din))
+        if (e.name != "." && e.name != "..") ++count;
+    CHECK(count == 40);
+
+    const auto ptrs = re.block_pointers(din);
+    REQUIRE(!ptrs.empty());
+    CHECK(ptrs[0] != first_block);
+
+    const auto rep = check_consistency(re, disk);
+    INFO("after boxed in growth:" << dump(rep));
+    CHECK(rep.cross_links == 0);
+    CHECK(rep.used_but_free == 0);
+    CHECK(rep.safe_to_write());
+}
+
+TEST_CASE("deleting an indirect file frees only its own tail fragments", "[realgeom][free]") {
+    auto disk = trg::build_real_geometry_image();
+    {
+        ufs2_filesystem fs(disk, 0);
+        REQUIRE(fs.mount());
+        ufs2_writer w(fs, disk);
+        trg::bootstrap_root(w);
+        const std::int64_t big_size = 12 * trg::kBlock + 2 * trg::kFrag;
+        const std::vector<std::byte> big(static_cast<std::size_t>(big_size), std::byte{0xAB});
+        w.write_file(2, "big.bin", {big.data(), big.size()});
+        w.update_superblock();
+        w.flush_dirty_cgs();
+    }
+
+    std::int64_t tail = 0;
+    {
+        ufs2_filesystem b(disk, 0);
+        REQUIRE(b.mount());
+        const auto f = b.resolve_path("big.bin");
+        REQUIRE(f.has_value());
+        const auto ptrs = b.block_pointers(*f);
+        REQUIRE(ptrs.size() == 13);
+        tail = ptrs.back();
+    }
+
+    const int cgn = static_cast<int>(tail / trg::kFpg);
+    const int base = static_cast<int>(tail % trg::kFpg);
+    const std::uint64_t cgoff = trg::cg_header_offset(cgn);
+    auto is_free = [&](int f) {
+        auto hdr = disk.read_bytes(cgoff, trg::kCgSize);
+        return (std::to_integer<int>(hdr[static_cast<std::size_t>(trg::kFreeoff) + f / 8]) >> (f % 8)) & 1;
+    };
+    {
+        auto hdr = disk.read_bytes(cgoff, trg::kCgSize);
+        for (int f = base + 2; f < base + 4; ++f)
+            hdr[static_cast<std::size_t>(trg::kFreeoff) + f / 8] &= static_cast<std::byte>(~(1 << (f % 8)));
+        disk.write_bytes(cgoff, {hdr.data(), hdr.size()});
+    }
+    REQUIRE_FALSE(is_free(base + 2));
+    REQUIRE_FALSE(is_free(base + 3));
+
+    ufs2_filesystem fs2(disk, 0);
+    REQUIRE(fs2.mount());
+    ufs2_writer w2(fs2, disk);
+    w2.repair_free_counts({});
+    w2.delete_tree(2, "big.bin");
+    w2.update_superblock();
+    w2.flush_dirty_cgs();
+
+    CHECK(is_free(base));
+    CHECK(is_free(base + 1));
+    CHECK_FALSE(is_free(base + 2));
+    CHECK_FALSE(is_free(base + 3));
+}

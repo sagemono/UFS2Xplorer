@@ -14,6 +14,7 @@
 #include <QHash>
 #include <QList>
 #include <QAction>
+#include <QFile>
 #include <QMainWindow>
 #include <QPersistentModelIndex>
 
@@ -93,6 +94,9 @@ private:
     void wire_signals(QPushButton* refresh, QPushButton* open);
 
     void log(const QString& line);
+    void set_status(const QString& line);
+    void open_log_file();
+    void log_session_header();
     QString current_serial() const;
     QString current_eid_hex() const;
     void navigate_to_path(const QString& path);
@@ -153,6 +157,7 @@ private:
     QHash<quint64, art_entry> art_cache_;
     const art_entry& art_for_dir(std::uint64_t inode);
     QPlainTextEdit* log_ = nullptr;
+    QFile log_file_;
     QProgressBar* progress_ = nullptr;
     QPushButton* install_btn_ = nullptr;
     QPushButton* license_btn_ = nullptr;

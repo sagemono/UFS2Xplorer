@@ -1,4 +1,4 @@
-#include "ufs2_writer.h"
+﻿#include "ufs2_writer.h"
 
 #include <ps3hdd_crypto/be_io.h>
 
@@ -685,8 +685,14 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
             if (extent < block_bytes) {
                 const int ofrags = static_cast<int>(extent / sb_.fragment_size);
                 const int nfrags = std::min(ofrags + 1, frags_per_block());
-                if (!frag_extend(frag, ofrags, nfrags))
-                    throw std::runtime_error("directory fragment full and cannot be extended in place");
+                std::int64_t dst = frag;
+                bool relocated = false;
+                if (!frag_extend(frag, ofrags, nfrags)) {
+                    const int pcg = static_cast<int>(parent_inode / sb_.inodes_per_group);
+                    cylinder_group* dst_cg = &read_cylinder_group(pcg);
+                    dst = use_lv2_policy_ ? alloc_run_pref(nfrags, frag, dst_cg) : alloc_run(nfrags, dst_cg);
+                    relocated = true;
+                }
 
                 const std::int64_t new_extent = static_cast<std::int64_t>(nfrags) * sb_.fragment_size;
                 std::vector<std::byte> grown(static_cast<std::size_t>(new_extent), std::byte{0});
@@ -695,11 +701,17 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
                     put_u16(grown, static_cast<std::size_t>(sec) + 4, superblock::dir_block_size);
 
                 auto updated = add_entry_to_directory_block(grown, child_inode, name, dir_entry_type);
-                write_data_block(frag, updated);
+                write_data_block(dst, updated);
+                if (relocated) {
+                    const int fpg = static_cast<int>(sb_.frags_per_group);
+                    auto& ocg = read_cylinder_group(static_cast<int>(frag / fpg));
+                    mark_fragments_free(ocg, static_cast<int>(frag % fpg), ofrags);
+                    write_cylinder_group(ocg);
+                    put_be64(pinode, 0x70 + i * 8, static_cast<std::uint64_t>(dst));
+                }
                 put_be64(pinode, 0x10, static_cast<std::uint64_t>(block_start + dir_block_used_bytes(updated)));
                 put_be64(pinode, 0x18,
-                         ps3hdd::read_be_u64(pinode.data() + 0x18) +
-                             static_cast<std::uint64_t>(nfrags - ofrags) * sb_.fragment_size / 512);
+                         ps3hdd::read_be_u64(pinode.data() + 0x18) + static_cast<std::uint64_t>(nfrags - ofrags) * sb_.fragment_size / 512);
                 save_inode();
                 return;
             }
@@ -1315,6 +1327,13 @@ void ufs2_writer::free_inode_blocks(const inode& in) {
     auto frag_ok = [&](std::int64_t f) {
         return f > 0 && (sb_.total_fragments <= 0 || f + fpb <= sb_.total_fragments);
     };
+    auto frags_for = [&](std::int64_t b) {
+        if (b != nblocks - 1) return fpb;
+        const std::int64_t tail = in.size - b * sb_.block_size;
+        const int n = static_cast<int>((tail + sb_.fragment_size - 1) / sb_.fragment_size);
+        return std::max(1, std::min(n, fpb));
+    };
+    auto free_data = [&](std::int64_t f, std::int64_t b) { if (frag_ok(f)) free_block_run(f, frags_for(b)); };
     auto free_ptr = [&](std::int64_t f) { if (frag_ok(f)) free_block_run(f, fpb); };
     auto try_read = [&](std::int64_t abs) -> std::optional<std::vector<std::byte>> {
         if (!frag_ok(abs)) return std::nullopt;
@@ -1343,7 +1362,7 @@ void ufs2_writer::free_inode_blocks(const inode& in) {
     if (in.indirect_block != 0) {
         if (auto blk = try_read(in.indirect_block))
             for (std::int64_t j = 0; j < ppb; ++j)
-                free_ptr(static_cast<std::int64_t>(ps3hdd::read_be_u64(blk->data() + j * 8)));
+                free_data(static_cast<std::int64_t>(ps3hdd::read_be_u64(blk->data() + j * 8)), 12 + j);
         free_ptr(in.indirect_block);
     }
 
@@ -1355,7 +1374,7 @@ void ufs2_writer::free_inode_blocks(const inode& in) {
                 if (l1p == 0) continue;
                 if (auto l1blk = try_read(l1p))
                     for (std::int64_t j = 0; j < ppb; ++j)
-                        free_ptr(static_cast<std::int64_t>(ps3hdd::read_be_u64(l1blk->data() + j * 8)));
+                        free_data(static_cast<std::int64_t>(ps3hdd::read_be_u64(l1blk->data() + j * 8)), 12 + ppb + l1 * ppb + j);
                 free_ptr(l1p);
             }
         free_ptr(in.double_indirect_block);

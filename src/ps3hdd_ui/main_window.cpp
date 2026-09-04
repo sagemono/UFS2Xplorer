@@ -22,8 +22,9 @@
 #include <QSettings>
 
 #ifndef UFS2XPLORER_VERSION
-#define UFS2XPLORER_VERSION "0.9.4"
+#define UFS2XPLORER_VERSION "0.9.5"
 #endif
+
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -31,6 +32,10 @@
 #include <QDateTime>
 #include <QDialog>
 #include <QDir>
+#include <QSysInfo>
+#include <QUrl>
+#include <QDesktopServices>
+#include <QStandardPaths>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
@@ -77,6 +82,11 @@
 #include <string>
 #include <span>
 #include <vector>
+
+namespace {
+QString log_dir() { return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + QStringLiteral("/logs"); }
+} // namespace
+
 
 #ifdef _WIN32
 #  ifndef NOMINMAX
@@ -230,6 +240,7 @@ void main_window::build_menus() {
     tools_menu->addAction(QStringLiteral("Sync Licenses to All Users..."), this, &main_window::sync_user_licenses);
     tools_menu->addSeparator();
     tools_menu->addAction(QStringLiteral("Export Log..."), this, &main_window::export_log);
+    tools_menu->addAction(QStringLiteral("Open Log Folder..."), this, [] { QDesktopServices::openUrl(QUrl::fromLocalFile(log_dir())); });
 
     auto* adv_menu = tools_menu->addMenu(QStringLiteral("Advanced"));
     lv2_policy_act_ = adv_menu->addAction(QStringLiteral("lv2 1:1 placement policy (EXPERIMENTAL)"));
@@ -247,7 +258,7 @@ void main_window::build_menus() {
         }
         QSettings st(settings_keys::org(), settings_keys::app());
         st.setValue(settings_keys::lv2_policy, on);
-        status_->setText(on ? QStringLiteral("lv2 1:1 placement policy enabled for new installs.")
+        set_status(on ? QStringLiteral("lv2 1:1 placement policy enabled for new installs.")
                             : QStringLiteral("lv2 1:1 placement policy disabled; using the normal allocator."));
     });
 
@@ -451,6 +462,8 @@ void main_window::build_browser(QVBoxLayout* root) {
     }
 
     log_ = new QPlainTextEdit();
+    open_log_file();
+    log_session_header();
     log_->setReadOnly(true);
     log_->setMaximumBlockCount(5000);
     split->addWidget(log_);
@@ -498,7 +511,35 @@ void main_window::wire_signals(QPushButton* refresh, QPushButton* open) {
     });
 }
 
-void main_window::log(const QString& line) { log_->appendPlainText(line); }
+void main_window::open_log_file() {
+    QDir().mkpath(log_dir());
+    QDir d(log_dir());
+    QStringList old = d.entryList(QStringList{QStringLiteral("ufs2xplorer-*.log")}, QDir::Files, QDir::Name);
+    while (old.size() >= 10) d.remove(old.takeFirst());
+    log_file_.setFileName(log_dir() + QStringLiteral("/ufs2xplorer-") + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")) + QStringLiteral(".log"));
+    log_file_.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
+}
+
+void main_window::log_session_header() {
+    log(QStringLiteral("UFS2Xplorer %1  (built %2, Qt %3)").arg(QStringLiteral(UFS2XPLORER_VERSION), QStringLiteral(__DATE__), QStringLiteral(QT_VERSION_STR)));
+    log(QStringLiteral("%1  |  %2").arg(QSysInfo::prettyProductName(), QSysInfo::currentCpuArchitecture()));
+    log(QStringLiteral("lv2 1:1 placement policy: %1").arg(app_setting(settings_keys::lv2_policy, false) ? QStringLiteral("ON (experimental)") : QStringLiteral("off")));
+    if (log_file_.isOpen()) log(QStringLiteral("log file: %1").arg(log_file_.fileName()));
+    else log(QStringLiteral("NOTE: could not open a log file in %1; only this window has the log.").arg(log_dir()));
+}
+
+void main_window::log(const QString& line) {
+    if (log_) log_->appendPlainText(line);
+    if (log_file_.isOpen()) {
+        log_file_.write(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")).toUtf8() + "  " + line.toUtf8() + "\n");
+        log_file_.flush();
+    }
+}
+
+void main_window::set_status(const QString& line) {
+    if (status_) status_->setText(line);
+    log(line);
+}
 
 bool main_window::ensure_broker() {
     if (broker_ready_ && broker_.connected()) return true;
@@ -518,13 +559,13 @@ bool main_window::ensure_broker() {
         QStringLiteral("/ps3hdd_helper");
 #endif
     if (!QFileInfo::exists(helper)) {
-        status_->setText(QStringLiteral("Disk helper not found next to the app: %1").arg(helper));
+        set_status(QStringLiteral("Disk helper not found next to the app: %1").arg(helper));
         return false;
     }
 
     log(QStringLiteral("Starting the elevated disk helper..."));
     if (!ps3hdd::ipc::launch_helper(helper, broker_port_, broker_token_)) {
-        status_->setText(QStringLiteral("Elevation was declined; disk access is unavailable."));
+        set_status(QStringLiteral("Elevation was declined; disk access is unavailable."));
         broker_port_ = 0; // regenerate + reprompt next time
         return false;
     }
@@ -543,7 +584,7 @@ bool main_window::ensure_broker() {
         }
     }
     log(QStringLiteral("Could not connect to the disk helper on port %1: %2").arg(broker_port_).arg(last_error));
-    status_->setText(QStringLiteral("Could not connect to the disk helper."));
+    set_status(QStringLiteral("Could not connect to the disk helper."));
     broker_port_ = 0;
     return false;
 }
@@ -586,7 +627,7 @@ void main_window::add_console() {
         log(QStringLiteral("Device enumeration failed: %1").arg(QString::fromUtf8(ex.what())));
         return;
     }
-    if (devs.isEmpty()) { status_->setText(QStringLiteral("No disks detected.")); return; }
+    if (devs.isEmpty()) { set_status(QStringLiteral("No disks detected.")); return; }
 
     auto test = [this](const QString& path, const QString& eid_hex) -> QString {
         const auto eid = parse_hex(eid_hex);
@@ -644,7 +685,7 @@ void main_window::open_device() {
     const QString path = current_device_path();
     const auto eid = parse_hex(current_eid_hex());
     if (eid.size() != 48) {
-        status_->setText(QStringLiteral("No saved key for this drive. Use 'Add Drive...' (or Tools > Manage Drives) to set up its EID key first."));
+        set_status(QStringLiteral("No saved key for this drive. Use 'Add Drive...' (or Tools > Manage Drives) to set up its EID key first."));
         return;
     }
 
@@ -660,12 +701,12 @@ void main_window::open_device() {
 
         mount_ = app::open_gameos(raw_, {eid.data(), eid.size()});
         if (!mount_) {
-            status_->setText(QStringLiteral("Could not locate/mount a GameOS partition on this disk."));
+            set_status(QStringLiteral("Could not locate/mount a GameOS partition on this disk."));
             return;
         }
         fs_ = std::make_unique<fs::ufs2_filesystem>(*mount_->decrypted, mount_->partition_sector);
         if (!fs_->mount()) {
-            status_->setText(QStringLiteral("GameOS superblock found but mount failed."));
+            set_status(QStringLiteral("GameOS superblock found but mount failed."));
             return;
         }
         const auto& sb = fs_->sb();
@@ -675,16 +716,20 @@ void main_window::open_device() {
         tree_->expand(model_->root_index());
         set_disk_actions_enabled(true);
         update_capacity();
+        log(QStringLiteral("mounted %1").arg(mount_desc_));
+        log(QStringLiteral("geometry: bsize=%1 fsize=%2 ipg=%3 fpg=%4 ncg=%5  |  free %6").arg(sb.block_size).arg(sb.fragment_size).arg(sb.inodes_per_group).arg(sb.frags_per_group).arg(sb.cylinder_groups).arg(QString::fromStdString(disk::format_size(static_cast<std::uint64_t>(sb.free_space_bytes() > 0 ? sb.free_space_bytes() : 0)))));
+        if (sb.min_free_percent != 8 || sb.optim != 0)
+            log(QStringLiteral("NOTE: minfree=%1%% optim=%2 - this disk was patched by the 'unlock HDD space' homebrew (stock is minfree=8%% optim=0).").arg(sb.min_free_percent).arg(sb.optim));
     } catch (const std::exception& ex) {
-        status_->setText(QStringLiteral("Error: %1").arg(QString::fromUtf8(ex.what())));
+        set_status(QStringLiteral("Error: %1").arg(QString::fromUtf8(ex.what())));
     }
 }
 
 void main_window::eject_drive() {
     if (job_thread_) return; // never mid-job
     const QString path = current_device_path();
-    if (path.isEmpty()) { status_->setText(QStringLiteral("Select a drive to eject first.")); return; }
-    if (!ensure_broker()) { status_->setText(QStringLiteral("No disk-helper connection to eject through.")); return; }
+    if (path.isEmpty()) { set_status(QStringLiteral("Select a drive to eject first.")); return; }
+    if (!ensure_broker()) { set_status(QStringLiteral("No disk-helper connection to eject through.")); return; }
 
     if (QMessageBox::question(
             this, QStringLiteral("Eject drive"),
@@ -703,7 +748,7 @@ void main_window::eject_drive() {
     try {
         const auto r = broker_.eject(path);
         log(r.message);
-        status_->setText(r.message);
+        set_status(r.message);
         update_capacity();
         set_disk_actions_enabled(false);
         QMessageBox::information(this, QStringLiteral("Eject drive"), r.removed ? QStringLiteral("Ejected. It is safe to remove the drive now.") : QStringLiteral("%1\n\nThe drive is parked, you can now remove it.").arg(r.message));
@@ -718,7 +763,7 @@ bool main_window::base_job(job& j) {
     const QString path = current_device_path();
     const auto eid = parse_hex(current_eid_hex());
     if (path.isEmpty() || eid.size() != 48) {
-        status_->setText(QStringLiteral("This drive has no saved key. Use 'Add Drive...' (or Tools > Manage Drives) to set it up first."));
+        set_status(QStringLiteral("This drive has no saved key. Use 'Add Drive...' (or Tools > Manage Drives) to set it up first."));
         return false;
     }
     if (!ensure_broker()) return false;
@@ -923,7 +968,7 @@ void main_window::start_job(job j, const QString& title) {
     connect(w, &worker::finished, this,
             [this, w, was_write, is_fileop, is_pkg_install](bool ok, const QString& summary) {
         log(summary);
-        status_->setText(summary);
+        set_status(summary);
         job_thread_->quit();
         job_thread_->wait();
         w->deleteLater();
@@ -950,7 +995,7 @@ void main_window::start_job(job j, const QString& title) {
 
 void main_window::install_pkg() {
     if (device_combo_->currentText().isEmpty()) {
-        status_->setText(QStringLiteral("Select a drive first (with a saved key)."));
+        set_status(QStringLiteral("Select a drive first (with a saved key)."));
         return;
     }
     const QStringList pkgs = QFileDialog::getOpenFileNames(
@@ -1091,7 +1136,7 @@ void main_window::do_license(const QString& rap_prefill) {
 
     if (dlg.exec() != QDialog::Accepted) return;
     if (!dlg.fill(j)) {
-        status_->setText(QStringLiteral("License needs a RAP file and a 16-byte IDPS."));
+        set_status(QStringLiteral("License needs a RAP file and a 16-byte IDPS."));
         return;
     }
 
@@ -1407,13 +1452,13 @@ void main_window::remount() {
 
 void main_window::update_capacity() {
     if (!status_) return;
-    if (!fs_) { status_->setText(QStringLiteral("No disk mounted.")); return; }
+    if (!fs_) { set_status(QStringLiteral("No disk mounted.")); return; }
     const auto& sb = fs_->sb();
     const std::uint64_t total =
         static_cast<std::uint64_t>(sb.total_data_fragments) * static_cast<std::uint64_t>(sb.fragment_size);
     const std::uint64_t free = static_cast<std::uint64_t>(sb.free_space_bytes());
     const QString capacity = QStringLiteral("%1 free of %2").arg(QString::fromStdString(disk::format_size(free)), QString::fromStdString(disk::format_size(total)));
-    status_->setText(mount_desc_.isEmpty() ? capacity : mount_desc_ + QStringLiteral("   |   ") + capacity);
+    set_status(mount_desc_.isEmpty() ? capacity : mount_desc_ + QStringLiteral("   |   ") + capacity);
 }
 
 const main_window::art_entry& main_window::art_for_dir(std::uint64_t inode) {
