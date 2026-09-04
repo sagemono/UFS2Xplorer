@@ -27,6 +27,7 @@ struct consistency_report {
     std::int64_t cluster_map_mismatches = 0;
     std::int64_t cluster_sum_mismatches = 0;
     std::int64_t cstotal_mismatches = 0;
+    std::vector<std::string> cross_linked_paths;
     std::vector<std::int64_t> used_but_free_frags;
     std::vector<std::string> findings; //human
 

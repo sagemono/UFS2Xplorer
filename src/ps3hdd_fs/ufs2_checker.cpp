@@ -24,6 +24,7 @@ public:
         walk_dir(ufs2_filesystem::root_inode);
         check_bitmaps();
         check_cg_summaries();
+        resolve_cross_link_paths();
         check_orphan_inodes();
         check_cs_array();
         report_.inodes_walked = static_cast<std::int64_t>(visited_.size());
@@ -51,6 +52,7 @@ private:
 
     std::unordered_set<std::uint64_t> visited_;
     std::unordered_map<std::int64_t, claim> claims_;
+    std::unordered_set<std::uint64_t> crosslinked_;
     consistency_report report_;
 
     void note(const std::string& msg) {
@@ -73,6 +75,8 @@ private:
             if (it != claims_.end()) {
                 if (it->second.inode != inum) {
                     ++report_.cross_links;
+                    crosslinked_.insert(it->second.inode);
+                    crosslinked_.insert(inum);
                     note("cross-link frag " + std::to_string(f) + ": inode " + std::to_string(it->second.inode) + " and inode " + std::to_string(inum));
                 }
             } else {
@@ -167,6 +171,28 @@ private:
                 note("used-but-free frag " + std::to_string(frag) + " (cg " + std::to_string(cgn) + "): inode " + std::to_string(inum) + " holds it but bitmap says free");
             }
         }
+    }
+
+    void resolve_cross_link_paths() {
+        if (crosslinked_.empty()) return;
+        std::function<void(std::uint64_t, const std::string&, int)> walk =
+            [&](std::uint64_t ino, const std::string& path, int depth) {
+                if (depth > 64 || crosslinked_.empty()) return;
+                inode in;
+                try { in = fs_.read_inode(ino); } catch (const std::exception&) { return; }
+                if (crosslinked_.erase(ino) > 0) {
+                    const std::string p = path.empty() ? std::string("/") : path;
+                    report_.cross_linked_paths.push_back(p + "  (inode " + std::to_string(ino) + ")");
+                }
+                if (!in.is_directory()) return;
+                std::vector<directory_entry> ents;
+                try { ents = fs_.read_directory(in); } catch (const std::exception&) { return; }
+                for (const auto& e : ents) {
+                    if (e.name == "." || e.name == "..") continue;
+                    walk(e.inode_number, path + "/" + e.name, depth + 1);
+                }
+            };
+        walk(ufs2_filesystem::root_inode, "", 0);
     }
 
     void check_orphan_inodes() {

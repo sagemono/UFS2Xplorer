@@ -803,3 +803,49 @@ TEST_CASE("deleting an indirect file frees only its own tail fragments", "[realg
     CHECK_FALSE(is_free(base + 2));
     CHECK_FALSE(is_free(base + 3));
 }
+
+
+TEST_CASE("crosslinked files are reported by path", "[realgeom][crosslink]") {
+    auto disk = trg::build_real_geometry_image();
+    std::uint64_t bino = 0;
+    {
+        ufs2_filesystem fs(disk, 0);
+        REQUIRE(fs.mount());
+        ufs2_writer w(fs, disk);
+        trg::bootstrap_root(w);
+        const std::vector<std::byte> d(static_cast<std::size_t>(trg::kBlock), std::byte{0x11});
+        w.write_file(2, "alpha.bin", {d.data(), d.size()});
+        bino = w.write_file(2, "beta.bin", {d.data(), d.size()});
+        w.update_superblock();
+        w.flush_dirty_cgs();
+    }
+
+    {
+        ufs2_filesystem b(disk, 0);
+        REQUIRE(b.mount());
+        const auto a = b.resolve_path("alpha.bin");
+        REQUIRE(a.has_value());
+        const std::int64_t ablk = b.block_pointers(*a).front();
+        const std::uint64_t off =
+            static_cast<std::uint64_t>(bino / trg::kIpg) * trg::kFpg * trg::kFrag +
+            static_cast<std::uint64_t>(trg::kIblkno) * trg::kFrag +
+            static_cast<std::uint64_t>(bino % trg::kIpg) * 256;
+        auto in = disk.read_bytes(off, 256);
+        ps3hdd::write_be_u64(in.data() + 0x70, static_cast<std::uint64_t>(ablk));
+        disk.write_bytes(off, {in.data(), in.size()});
+    }
+
+    ufs2_filesystem re(disk, 0);
+    REQUIRE(re.mount());
+    const auto rep = check_consistency(re, disk);
+    CHECK(rep.cross_links > 0);
+    CHECK(rep.structurally_damaged());
+    CHECK_FALSE(rep.safe_to_write());
+
+    std::string all;
+    for (const auto& p : rep.cross_linked_paths) all += p + "\n";
+    INFO("paths:\n" << all);
+    CHECK(rep.cross_linked_paths.size() == 2);
+    CHECK(all.find("alpha.bin") != std::string::npos);
+    CHECK(all.find("beta.bin") != std::string::npos);
+}

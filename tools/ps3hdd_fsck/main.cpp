@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
         std::printf("Walked %lld inodes, %lld fragments claimed.\n", (long long)rep.inodes_walked, (long long)rep.fragments_claimed);
         std::printf("cross_links: %lld   out_of_range: %lld   used_but_free: %lld\n", (long long)rep.cross_links, (long long)rep.out_of_range, (long long)rep.used_but_free);
         for (const auto& f : rep.findings) std::printf("  %s\n", f.c_str());
+        for (const auto& cp : rep.cross_linked_paths) std::printf("  cross-linked file: %s\n", cp.c_str());
 
         std::printf("\n== RESULT ==\n" "  cross_links=%lld  out_of_range=%lld  used_but_free=%lld  summary-mismatches=%lld\n", (long long)rep.cross_links, (long long)rep.out_of_range, (long long)rep.used_but_free, (long long)rep.summary_mismatches);
         std::printf("  cluster-map-mismatches=%lld  cluster-sum-mismatches=%lld\n",

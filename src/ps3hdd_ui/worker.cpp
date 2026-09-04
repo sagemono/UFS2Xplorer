@@ -499,6 +499,8 @@ void worker::run_file_operation(app::gameos_mount& m, fs::ufs2_filesystem& ufs) 
 void worker::run_consistency(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     const auto rep = fs::check_consistency(ufs, *m.decrypted);
     for (const auto& f : rep.findings) emit progress(QString::fromStdString(f), -1);
+    for (const auto& p : rep.cross_linked_paths)
+        emit progress(QStringLiteral("cross-linked file: %1").arg(QString::fromStdString(p)), -1);
     const QString msg = QString::fromStdString(rep.summary_line());
     QString verdict;
     if (rep.structurally_damaged())
@@ -659,7 +661,10 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     }
     const QString msg = QStringLiteral("consistency: ") + QString::fromStdString(rep.summary_line());
     if (!rep.safe_to_write()) {
-        emit finished(false, QStringLiteral("Installed to %1 BUT %2 - do NOT boot; restore the disk.").arg(QString::fromStdString(path), msg));
+        for (const auto& p : rep.cross_linked_paths)
+            emit progress(QStringLiteral("cross-linked file: %1").arg(QString::fromStdString(p)), -1);
+        const QString why = rep.structurally_damaged() ? QStringLiteral(" The damage may pre-date this install; run Check Consistency to see which files share blocks.") : QString();
+        emit finished(false, QStringLiteral("Installed to %1 BUT %2 - do NOT boot; restore the disk.%3").arg(QString::fromStdString(path), msg, why));
         return;
     }
     const QString tail = job_.rebuild_db ? QStringLiteral("  Rebuild flag set (mms/db.err) - just reboot; no safe mode needed.") : QStringLiteral("  On the console: Safe Mode -> Rebuild Database to list the game.");
