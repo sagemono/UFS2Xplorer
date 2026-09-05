@@ -56,6 +56,14 @@ $keep = @('UFS2Xplorer.exe', 'ps3hdd_helper.exe')
 Get-ChildItem $stage -Filter *.exe | Where-Object { $keep -notcontains $_.Name } | Remove-Item -Force
 Get-ChildItem $stage -Recurse -Include *.pdb, *.ilk, *.exp, *.log -ErrorAction SilentlyContinue | Remove-Item -Force
 
+$allowLoose = $keep + @('qt.conf')
+Get-ChildItem $stage -File | Where-Object {
+    $_.Extension -ne '.dll' -and $allowLoose -notcontains $_.Name
+} | ForEach-Object {
+    Say "pruning stray file: $($_.Name) ($([math]::Round($_.Length/1MB,1)) MB)"
+    Remove-Item -Force $_.FullName
+}
+
 foreach ($x in 'UFS2Xplorer.exe', 'ps3hdd_helper.exe', 'Qt6Core.dll') {
     if (-not (Test-Path (Join-Path $stage $x))) { throw "package is missing $x" }
 }

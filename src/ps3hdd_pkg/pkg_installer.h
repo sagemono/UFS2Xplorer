@@ -38,8 +38,8 @@ private:
 
     dir_node build_tree() const;
     std::int64_t resolve_child(std::uint64_t parent, const std::string& name) const;
-    std::uint64_t ensure_directory(std::uint64_t parent, const std::string& name);
-    void install_node(const dir_node& node, std::uint64_t dir_inode, int total, int& done, const file_progress& progress, const byte_progress& on_written);
+    std::uint64_t ensure_directory(std::uint64_t parent, const std::string& name, const std::string& path);
+    void install_node(const dir_node& node, std::uint64_t dir_inode, const std::string& path, int total, int& done, const file_progress& progress, const byte_progress& on_written);
 };
 
 } // namespace ps3hdd::pkg

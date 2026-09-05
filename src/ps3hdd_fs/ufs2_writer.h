@@ -37,6 +37,7 @@ struct cylinder_group {
 class ufs2_writer {
 public:
     ufs2_writer(ufs2_filesystem& fs, disk::disk_source& disk);
+    ~ufs2_writer();
 
     cylinder_group& read_cylinder_group(int cg_number);
     void write_cylinder_group(cylinder_group& cg);

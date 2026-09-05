@@ -22,7 +22,7 @@
 #include <QSettings>
 
 #ifndef UFS2XPLORER_VERSION
-#define UFS2XPLORER_VERSION "0.9.5"
+#define UFS2XPLORER_VERSION "0.9.7"
 #endif
 
 #include <QApplication>

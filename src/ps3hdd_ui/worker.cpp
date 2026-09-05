@@ -626,13 +626,21 @@ void worker::run_install_pkg(app::gameos_mount& m, fs::ufs2_filesystem& ufs) {
     pkg::pkg_installer installer(ufs, writer, pkg);
     xfer_meter meter(*this);
     meter.total = static_cast<qint64>(installer.total_bytes());
-    const std::string path = installer.install(
-        [&](const std::string& name, int done, int total) {
-            if (cancel_.load()) throw std::runtime_error("cancelled");
-            const QString line = total > 0 ? QStringLiteral("[%1/%2] %3").arg(done).arg(total).arg(QString::fromStdString(name)) : QString::fromStdString(name);
-            emit progress(line, meter.pct());
-        },
-        [&](std::int64_t n) { meter.add(n); });
+    std::string path;
+    try {
+            path = installer.install(
+            [&](const std::string& name, int done, int total) {
+                if (cancel_.load()) throw std::runtime_error("cancelled");
+                const QString line = total > 0 ? QStringLiteral("[%1/%2] %3").arg(done).arg(total).arg(QString::fromStdString(name)) : QString::fromStdString(name);
+                emit progress(line, meter.pct());
+            },
+            [&](std::int64_t n) { meter.add(n); });
+    } catch (const std::exception&) {
+        emit speed(0.0);
+        emit progress(QStringLiteral("Install failed - reconciling the free-space bitmaps ..."), -1);
+        try { writer.update_superblock(); } catch (...) {}
+        throw;
+    }
     emit speed(0.0);
     const QString xfer = meter.summary();
     if (job_.rebuild_db) {

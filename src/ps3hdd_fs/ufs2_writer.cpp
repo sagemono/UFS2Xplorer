@@ -104,6 +104,10 @@ std::array<std::int64_t, 5> ufs2_writer::compute_cg_summary(const cylinder_group
     return {d, b, fi, ff, nclusters};
 }
 
+ufs2_writer::~ufs2_writer() {
+    try { flush_dirty_cgs(); } catch (...) {}
+}
+
 void ufs2_writer::write_cylinder_group(cylinder_group& cg) {
     dirty_cgs_.insert(cg.number);
     refresh_policy_summary(cg);
@@ -639,10 +643,43 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
     const std::int64_t block_bytes = sb_.block_size; // directory blocks are whole blocks
     auto save_inode = [&]() { write_inode(parent_inode, pinode); };
 
-    for (int i = 0; i < 12; ++i) {
-        const std::int64_t frag = static_cast<std::int64_t>(ps3hdd::read_be_u64(pinode.data() + 0x70 + i * 8));
+    const std::int64_t ppb = sb_.block_size / 8;
+    std::int64_t ind_frag = static_cast<std::int64_t>(ps3hdd::read_be_u64(pinode.data() + 0xD0));
+    std::vector<std::byte> ind_blk;
+    bool ind_loaded = false;
+    auto load_ind = [&]() {
+        if (ind_loaded) return;
+        if (ind_frag != 0)
+            ind_blk = disk_.read_bytes(fs_.partition_offset_bytes() + static_cast<std::uint64_t>(ind_frag) * sb_.fragment_size, static_cast<std::size_t>(block_bytes));
+        else
+            ind_blk.assign(static_cast<std::size_t>(block_bytes), std::byte{0});
+        ind_loaded = true;
+    };
+    auto get_ptr = [&](int b) -> std::int64_t {
+        if (b < 12) return static_cast<std::int64_t>(ps3hdd::read_be_u64(pinode.data() + 0x70 + b * 8));
+        if (ind_frag == 0) return 0;
+        load_ind();
+        return static_cast<std::int64_t>(ps3hdd::read_be_u64(ind_blk.data() + (b - 12) * 8));
+    };
+    auto set_ptr = [&](int b, std::int64_t v) {
+        if (b < 12) { put_be64(pinode, 0x70 + b * 8, static_cast<std::uint64_t>(v)); return; }
+        if (ind_frag == 0) {
+            const int pcg = static_cast<int>(parent_inode / sb_.inodes_per_group);
+            cylinder_group* icg = &read_cylinder_group(pcg);
+            ind_frag = alloc_run(frags_per_block(), icg);
+            ind_blk.assign(static_cast<std::size_t>(block_bytes), std::byte{0});
+            ind_loaded = true;
+            put_be64(pinode, 0xD0, static_cast<std::uint64_t>(ind_frag));
+            put_be64(pinode, 0x18, ps3hdd::read_be_u64(pinode.data() + 0x18) + static_cast<std::uint64_t>(block_bytes) / 512);
+        }
+        load_ind();
+        put_be64(ind_blk, static_cast<std::size_t>(b - 12) * 8, static_cast<std::uint64_t>(v));
+        write_data_block(ind_frag, ind_blk);
+    };
+
+    for (int i = 0; i < 12 + static_cast<int>(ppb); ++i) {
+        const std::int64_t frag = get_ptr(i);
         if (frag == 0) {
-            // all existing blocks are full: allocate a new directory fragment
             const int parent_cg = static_cast<int>(parent_inode / sb_.inodes_per_group);
             cylinder_group* block_cg = &read_cylinder_group(parent_cg);
             const std::int64_t abs = alloc_run(frags_per_block(), block_cg); // may span cgs!
@@ -653,8 +690,7 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
             auto updated = add_entry_to_directory_block(block, child_inode, name, dir_entry_type);
             write_data_block(abs, updated);
 
-            put_be64(pinode, 0x70 + i * 8, static_cast<std::uint64_t>(abs));
-            // di_size covers only the used DIRBLKSIZ sections of this new block, not the whole fs block which would claim unallocated frags
+            set_ptr(i, abs);
             put_be64(pinode, 0x10, static_cast<std::uint64_t>(static_cast<std::int64_t>(i) * block_bytes + dir_block_used_bytes(updated))); // di_size
             put_be64(pinode, 0x18, ps3hdd::read_be_u64(pinode.data() + 0x18) + block_bytes / 512); // di_blocks
             save_inode();
@@ -662,8 +698,7 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
         }
 
         const std::int64_t cur_size = static_cast<std::int64_t>(ps3hdd::read_be_u64(pinode.data() + 0x10));
-        const std::int64_t alloc_bytes =
-            static_cast<std::int64_t>(ps3hdd::read_be_u64(pinode.data() + 0x18)) * 512;
+        const std::int64_t alloc_bytes = static_cast<std::int64_t>(ps3hdd::read_be_u64(pinode.data() + 0x18)) * 512 - (ind_frag != 0 ? block_bytes : 0); // di_blocks counts the pointer block too
         const std::int64_t block_start = static_cast<std::int64_t>(i) * block_bytes;
         std::int64_t extent = alloc_bytes - block_start; // allocated bytes in this block
         if (extent > block_bytes) extent = block_bytes;
@@ -707,7 +742,7 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
                     auto& ocg = read_cylinder_group(static_cast<int>(frag / fpg));
                     mark_fragments_free(ocg, static_cast<int>(frag % fpg), ofrags);
                     write_cylinder_group(ocg);
-                    put_be64(pinode, 0x70 + i * 8, static_cast<std::uint64_t>(dst));
+                    set_ptr(i, dst);
                 }
                 put_be64(pinode, 0x10, static_cast<std::uint64_t>(block_start + dir_block_used_bytes(updated)));
                 put_be64(pinode, 0x18,
@@ -717,7 +752,7 @@ void ufs2_writer::add_entry_to_directory(std::uint64_t parent_inode, std::uint64
             }
         }
     }
-    throw std::runtime_error("directory too large: needs indirect directory blocks (not yet supported)");
+    throw std::runtime_error("directory too large: needs double indirect directory blocks (not yet supported)");
 }
 
 bool ufs2_writer::frag_extend(std::int64_t abs_frag, int ofrags, int nfrags) {
@@ -1384,12 +1419,20 @@ void ufs2_writer::free_inode_blocks(const inode& in) {
 std::uint64_t ufs2_writer::remove_entry_from_directory(std::uint64_t parent_inode, const std::string& name) {
     const auto parent = fs_.read_inode(parent_inode);
     const std::size_t block_bytes = static_cast<std::size_t>(sb_.block_size);
-    for (int i = 0; i < 12; ++i) {
-        const std::int64_t frag = parent.direct_blocks[i];
-        if (frag == 0) break;
+    // dirs can run past the 12 direct pointers into di_ib[0], so removal has to walk the same blocks the writer adds to, not just the direct ones.
+    const auto dir_blocks = fs_.block_pointers(parent);
+    for (std::size_t bi = 0; bi < dir_blocks.size(); ++bi) {
+        const std::int64_t frag = dir_blocks[bi];
+        if (frag == 0) continue;
         const std::uint64_t off = fs_.partition_offset_bytes() +
             static_cast<std::uint64_t>(frag) * sb_.fragment_size;
-        auto block = disk_.read_bytes(off, block_bytes);
+        std::size_t extent = block_bytes;
+        const std::int64_t used_here = parent.size - static_cast<std::int64_t>(bi) * static_cast<std::int64_t>(block_bytes);
+        if (used_here < static_cast<std::int64_t>(block_bytes)) {
+            const std::int64_t rounded = ((used_here + sb_.fragment_size - 1) / sb_.fragment_size) * sb_.fragment_size;
+            extent = static_cast<std::size_t>(std::max<std::int64_t>(sb_.fragment_size, std::min<std::int64_t>(rounded, static_cast<std::int64_t>(block_bytes))));
+        }
+        auto block = disk_.read_bytes(off, extent);
 
         constexpr int DIRBLKSIZ = 512;
         const int sections = static_cast<int>(block.size()) / DIRBLKSIZ;

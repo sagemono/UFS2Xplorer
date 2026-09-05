@@ -849,3 +849,127 @@ TEST_CASE("crosslinked files are reported by path", "[realgeom][crosslink]") {
     CHECK(all.find("alpha.bin") != std::string::npos);
     CHECK(all.find("beta.bin") != std::string::npos);
 }
+.
+TEST_CASE("a directory grows past 12 direct blocks into an indirect block", "[realgeom][dirbig]") {
+    auto disk = trg::build_real_geometry_image();
+    ufs2_filesystem fs(disk, 0);
+    REQUIRE(fs.mount());
+    ufs2_writer w(fs, disk);
+    trg::bootstrap_root(w);
+
+    const std::uint64_t dir = w.create_directory(2, "USRDIR");
+    const std::string pad(244, 'y');
+    const int kEntries = 420;
+    const std::vector<std::byte> tiny(16, std::byte{0x7E});
+    for (int i = 0; i < kEntries; ++i) {
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "f%04d_", i);
+        REQUIRE_NOTHROW(w.write_file(dir, nm + pad, {tiny.data(), tiny.size()}));
+    }
+    w.update_superblock();
+    w.flush_dirty_cgs();
+
+    ufs2_filesystem re(disk, 0);
+    REQUIRE(re.mount());
+    const auto dino = re.resolve_path_to_inode_number("USRDIR");
+    REQUIRE(dino.has_value());
+    const auto din = re.read_inode(*dino);
+
+    CHECK(din.indirect_block != 0);
+
+    int count = 0;
+    for (const auto& e : re.read_directory(din))
+        if (e.name != "." && e.name != "..") ++count;
+    CHECK(count == kEntries);
+
+    for (int i = 0; i < kEntries; i += 37) {
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "f%04d_", i);
+        const auto f = re.resolve_path(std::string("USRDIR/") + nm + pad);
+        REQUIRE(f.has_value());
+        CHECK(re.read_inode_data(*f) == tiny);
+    }
+
+    const auto rep = check_consistency(re, disk);
+    INFO("after indirect directory growth:" << dump(rep));
+    CHECK(rep.cross_links == 0);
+    CHECK(rep.used_but_free == 0);
+    CHECK(rep.safe_to_write());
+}
+
+TEST_CASE("an abandoned writer still flushes its allocation bitmaps", "[realgeom][flush]") {
+    auto disk = trg::build_real_geometry_image();
+    {
+        ufs2_filesystem fs(disk, 0);
+        REQUIRE(fs.mount());
+        ufs2_writer w(fs, disk);
+        trg::bootstrap_root(w);
+        w.update_superblock();
+        w.flush_dirty_cgs();
+    }
+
+    {
+        ufs2_filesystem fs(disk, 0);
+        REQUIRE(fs.mount());
+        ufs2_writer w(fs, disk);
+        const std::vector<std::byte> d(static_cast<std::size_t>(trg::kBlock) * 3, std::byte{0x42});
+        w.write_file(2, "aborted.bin", {d.data(), d.size()});
+    }
+
+    ufs2_filesystem re(disk, 0);
+    REQUIRE(re.mount());
+    const auto rep = check_consistency(re, disk);
+    INFO("after an abandoned write:" << dump(rep));
+    CHECK(rep.used_but_free == 0);
+    CHECK(rep.cross_links == 0);
+}
+
+TEST_CASE("entries can be removed from an indirect directory", "[realgeom][dirbig]") {
+    auto disk = trg::build_real_geometry_image();
+    ufs2_filesystem fs(disk, 0);
+    REQUIRE(fs.mount());
+    ufs2_writer w(fs, disk);
+    trg::bootstrap_root(w);
+
+    const std::uint64_t dir = w.create_directory(2, "USRDIR");
+    const std::string pad(244, 'z');
+    const int kEntries = 420;
+    const std::vector<std::byte> tiny(16, std::byte{0x5F});
+    std::vector<std::string> names;
+    for (int i = 0; i < kEntries; ++i) {
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "g%04d_", i);
+        names.push_back(nm + pad);
+        w.write_file(dir, names.back(), {tiny.data(), tiny.size()});
+    }
+    w.update_superblock();
+    w.flush_dirty_cgs();
+
+    {
+        ufs2_filesystem chk(disk, 0);
+        REQUIRE(chk.mount());
+        REQUIRE(chk.read_inode(*chk.resolve_path_to_inode_number("USRDIR")).indirect_block != 0);
+    }
+
+    // one from the far end, which can only live in the indirect region
+    REQUIRE_NOTHROW(w.delete_tree(dir, names.back()));
+    REQUIRE_NOTHROW(w.delete_tree(dir, names[kEntries / 2]));
+    w.update_superblock();
+    w.flush_dirty_cgs();
+
+    ufs2_filesystem re(disk, 0);
+    REQUIRE(re.mount());
+    const auto din = re.read_inode(*re.resolve_path_to_inode_number("USRDIR"));
+    int count = 0;
+    for (const auto& e : re.read_directory(din))
+        if (e.name != "." && e.name != "..") ++count;
+    CHECK(count == kEntries - 2);
+    CHECK_FALSE(re.resolve_path("USRDIR/" + names.back()).has_value());
+    CHECK(re.resolve_path("USRDIR/" + names.front()).has_value());
+
+    const auto rep = check_consistency(re, disk);
+    INFO("after indirect removal:" << dump(rep));
+    CHECK(rep.cross_links == 0);
+    CHECK(rep.used_but_free == 0);
+    CHECK(rep.safe_to_write());
+}

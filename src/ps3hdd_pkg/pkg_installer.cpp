@@ -43,13 +43,18 @@ std::int64_t pkg_installer::resolve_child(std::uint64_t parent, const std::strin
     return -1;
 }
 
-std::uint64_t pkg_installer::ensure_directory(std::uint64_t parent, const std::string& name) {
+std::uint64_t pkg_installer::ensure_directory(std::uint64_t parent, const std::string& name, const std::string& path) {
     const std::int64_t existing = resolve_child(parent, name);
-    if (existing >= 0) return static_cast<std::uint64_t>(existing);
+    if (existing >= 0) {
+        const auto in = fs_.read_inode(static_cast<std::uint64_t>(existing));
+        if (!in.is_directory())
+            throw std::runtime_error("cannot install into " + path + name + "/: a file of that name is already on the disk (inode " + std::to_string(existing) + "). Delete it, or uninstall the title, then install again.");
+        return static_cast<std::uint64_t>(existing);
+    }
     return writer_.create_directory(parent, name);
 }
 
-void pkg_installer::install_node(const dir_node& node, std::uint64_t dir_inode, int total, int& done, const file_progress& progress, const byte_progress& on_written) {
+void pkg_installer::install_node(const dir_node& node, std::uint64_t dir_inode, const std::string& path, int total, int& done, const file_progress& progress, const byte_progress& on_written) {
     for (const auto& [name, entry] : node.files) {
         if (progress) progress(name, done + 1, total);
         const bool exists = resolve_child(dir_inode, name) >= 0;
@@ -64,8 +69,8 @@ void pkg_installer::install_node(const dir_node& node, std::uint64_t dir_inode, 
         ++done;
     }
     for (const auto& [name, child] : node.dirs) {
-        const std::uint64_t child_inode = ensure_directory(dir_inode, name);
-        install_node(child, child_inode, total, done, progress, on_written);
+        const std::uint64_t child_inode = ensure_directory(dir_inode, name, path);
+        install_node(child, child_inode, path + name + "/", total, done, progress, on_written);
     }
 }
 
@@ -81,8 +86,8 @@ std::string pkg_installer::install(const file_progress& progress, const byte_pro
     if (tid.empty())
         throw std::runtime_error("could not determine TITLE_ID from the package");
 
-    const std::uint64_t game = ensure_directory(fs::ufs2_filesystem::root_inode, "game");
-    const std::uint64_t title = ensure_directory(game, tid);
+    const std::uint64_t game = ensure_directory(fs::ufs2_filesystem::root_inode, "game", "");
+    const std::uint64_t title = ensure_directory(game, tid, "game/");
 
     const dir_node root = build_tree();
     int total = 0;
@@ -90,7 +95,7 @@ std::string pkg_installer::install(const file_progress& progress, const byte_pro
         if (!e.is_directory) ++total;
 
     int done = 0;
-    install_node(root, title, total, done, progress, on_written);
+    install_node(root, title, "game/" + tid + "/", total, done, progress, on_written);
 
     writer_.update_superblock();
     return "game/" + tid;
