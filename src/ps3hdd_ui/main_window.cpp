@@ -31,6 +31,9 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDialog>
+#include <QGuiApplication>
+#include <QClipboard>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QSysInfo>
 #include <QUrl>
@@ -258,24 +261,11 @@ void main_window::build_menus() {
         }
         QSettings st(settings_keys::org(), settings_keys::app());
         st.setValue(settings_keys::lv2_policy, on);
-        set_status(on ? QStringLiteral("lv2 1:1 placement policy enabled for new installs.")
-                            : QStringLiteral("lv2 1:1 placement policy disabled; using the normal allocator."));
+        set_status(on ? QStringLiteral("lv2 1:1 placement policy enabled for new installs.") : QStringLiteral("lv2 1:1 placement policy disabled; using the normal allocator."));
     });
 
     auto* help_menu = menuBar()->addMenu(QStringLiteral("&Help"));
-    help_menu->addAction(QStringLiteral("About"), this, [this] {
-        QMessageBox::about(
-            this, QStringLiteral("About UFS2Xplorer"),
-            QStringLiteral(
-                "<b>UFS2Xplorer</b> %1<br>A cross-platform PS3 hard-drive explorer and package manager.<br>"
-                "Built %2, Qt %3.<br><br>"
-                "Icons: <b>Silk icon set 1.3</b> by Mark James "
-                "(<a href=\"https://www.famfamfam.com/lab/icons/silk/\">famfamfam.com/lab/icons/silk</a>), "
-                "licensed under <a href=\"https://creativecommons.org/licenses/by/2.5/\">"
-                "Creative Commons Attribution 2.5 Generic (CC BY 2.5)</a>.<br><br>"
-                "Not affiliated with Sony Interactive Entertainment.")
-                .arg(QStringLiteral(UFS2XPLORER_VERSION), QStringLiteral(__DATE__), QStringLiteral(QT_VERSION_STR)));
-    });
+    help_menu->addAction(QStringLiteral("About"), this, &main_window::show_about);
 }
 
 void main_window::build_disk_row(QVBoxLayout* root, QPushButton*& refresh, QPushButton*& open) {
@@ -464,6 +454,7 @@ void main_window::build_browser(QVBoxLayout* root) {
     log_ = new QPlainTextEdit();
     open_log_file();
     log_session_header();
+    QTimer::singleShot(0, this, &main_window::show_beta_notice);
     log_->setReadOnly(true);
     log_->setMaximumBlockCount(5000);
     split->addWidget(log_);
@@ -518,6 +509,93 @@ void main_window::open_log_file() {
     while (old.size() >= 10) d.remove(old.takeFirst());
     log_file_.setFileName(log_dir() + QStringLiteral("/ufs2xplorer-") + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")) + QStringLiteral(".log"));
     log_file_.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
+}
+
+void main_window::show_about() {
+    const QString ver = QStringLiteral(UFS2XPLORER_VERSION);
+    const QString plain = QStringLiteral("UFS2Xplorer %1 (built %2)\nQt %3\n%4 | %5").arg(ver, QStringLiteral(__DATE__), QStringLiteral(QT_VERSION_STR), QSysInfo::prettyProductName(), QSysInfo::currentCpuArchitecture());
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("About UFS2Xplorer"));
+    auto* lay = new QVBoxLayout(&dlg);
+
+    auto* text = new QLabel(&dlg);
+    text->setTextFormat(Qt::RichText);
+    text->setOpenExternalLinks(true);
+    text->setWordWrap(true);
+    text->setText(QStringLiteral(
+        "<div style='font-size:13pt;'><b>UFS2Xplorer</b></div>"
+        "<div style='color:gray;'>%1 (built %2)<br>Qt %3<br>%4 | %5</div>"
+        "<p>A cross-platform PS3 hard-drive explorer and package manager.</p>"
+        "<p><b>Developed by</b><br>"
+        "<a href=\"https://github.com/sagemono/UFS2Xplorer\">sagemono</a></p>"
+        "<p><b>Credits</b><br>"
+        "<span style='color:gray;'>Reading a PS3 drive on a PC was worked out by the homebrew scene long before this app existed.</span></p>"
+        "<b>Mena</b> - <a href=\"https://github.com/Pheeeeenom/PS3HDDTool\">PS3HDDTool</a>, for the base application C# code UFS2Xplorer was derrived from<br>"
+        "<b>3141card</b> - <a href=\"https://github.com/jhonathanc/PS3-HDD-Reader\">PS3 HDD Reader</a>, and the homebrew that automates the reserved-space change<br>"
+        "<b>Berion</b> - HDD key generation scripts, the decryption helper, and the <a href=\"https://www.psx-place.com/threads/how-to-read-data-from-playstation-3-hdd-on-pc-tutorials-tools-hub-faq.36261/\">psx-place tutorial hub</a><br>"
+        "<b>glevand</b> - original OtherOS drive mounting, and the <a href=\"http://www.psdevwiki.com/ps3/Mounting_HDD_on_PC\">psdevwiki</a> writeup<br>"
+        "<b>sguerrini97</b> and <b>dsroche</b> - <a href=\"https://github.com/sguerrini97/nbdcpp\">nbdcpp</a>, mounting on modern Linux kernels<br>"
+        "<b>einsteinx2</b> - the reserved-space tutorial</p>"
+        "<p><b>Attributions</b><br>"
+        "<b>Silk icon set 1.3</b> by Mark James - <a href=\"https://creativecommons.org/licenses/by/2.5/\">CC BY 2.5</a><br>"
+        "<b>Qt 6</b> - LGPLv3<br>"
+        "<b>OpenSSL</b> - Apache License 2.0<br>"
+        "<b>Catch2</b> - Boost Software License 1.0 (tests only)</p>"
+        "<p style='color:gray;'>Not affiliated with Sony Interactive Entertainment.</p>").arg(ver, QStringLiteral(__DATE__), QStringLiteral(QT_VERSION_STR), QSysInfo::prettyProductName(), QSysInfo::currentCpuArchitecture()));
+    text->setMinimumWidth(460);
+    lay->addWidget(text);
+
+    auto* buttons = new QDialogButtonBox(&dlg);
+    QPushButton* bug = buttons->addButton(QStringLiteral("Report a Bug"), QDialogButtonBox::ActionRole);
+    QPushButton* copy = buttons->addButton(QStringLiteral("Copy Version Info"), QDialogButtonBox::ActionRole);
+    buttons->addButton(QDialogButtonBox::Close);
+    lay->addWidget(buttons);
+
+    connect(bug, &QPushButton::clicked, this, [] {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/sagemono/UFS2Xplorer/issues/new")));
+    });
+    connect(copy, &QPushButton::clicked, this, [plain, copy] {
+        QGuiApplication::clipboard()->setText(plain);
+        copy->setText(QStringLiteral("Copied"));
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::accept);
+    dlg.exec();
+}
+
+void main_window::show_beta_notice() {
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(QStringLiteral("UFS2Xplorer %1 - early release").arg(QStringLiteral(UFS2XPLORER_VERSION)));
+    box.setText(QStringLiteral("<b>This is early beta software that writes directly to your PS3 hard drive.</b>"));
+    box.setInformativeText(QStringLiteral(
+        "It can corrupt the filesystem or destroy data on the drive. Bugs that did exactly "
+        "that have been found and fixed during testing, and there are certainly others that "
+        "have not been found yet.<br><br>"
+        "<b>Before you use it:</b><br>"
+        "&nbsp;&nbsp;- <b>Back up your save data and trophies first.</b> Right-click "
+        "<i>home/&lt;user&gt;/savedata</i> and <i>trophy</i> and choose Extract. Games and updates can be "
+        "downloaded again - saves cannot.<br>"
+        "&nbsp;&nbsp;- Keep a backup of the whole drive if you have the space for one, and keep it "
+        "until you are sure the drive is healthy.<br>"
+        "&nbsp;&nbsp;- Know how to run Safe Mode -&gt; Restore File System on the console before you need it.<br>"
+        "&nbsp;&nbsp;- Run <b>Check Consistency</b> after anything that writes, and again before you put "
+        "the drive back in the console.<br><br>"
+        "There is <b>no warranty of any kind</b>. You use this entirely at your own risk, and the "
+        "developers accept no responsibility for lost data, corrupted drives or unbootable consoles.<br><br>"
+        "Bug reports are very welcome - <b>Tools &gt; Open Log Folder</b> has the session log to attach."));
+    QPushButton* go = box.addButton(QStringLiteral("I understand"), QMessageBox::AcceptRole);
+    QPushButton* out = box.addButton(QStringLiteral("Exit"), QMessageBox::RejectRole);
+    box.setDefaultButton(out);
+    box.setEscapeButton(out);
+    box.exec();
+    if (box.clickedButton() != go) {
+        log(QStringLiteral("beta notice declined; exiting."));
+        close();
+        QCoreApplication::quit();
+        return;
+    }
+    log(QStringLiteral("beta notice acknowledged."));
 }
 
 void main_window::log_session_header() {

@@ -97,6 +97,8 @@ private:
     void set_status(const QString& line);
     void open_log_file();
     void log_session_header();
+    void show_beta_notice();
+    void show_about();
     QString current_serial() const;
     QString current_eid_hex() const;
     void navigate_to_path(const QString& path);

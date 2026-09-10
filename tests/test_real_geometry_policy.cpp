@@ -849,7 +849,6 @@ TEST_CASE("crosslinked files are reported by path", "[realgeom][crosslink]") {
     CHECK(all.find("alpha.bin") != std::string::npos);
     CHECK(all.find("beta.bin") != std::string::npos);
 }
-.
 TEST_CASE("a directory grows past 12 direct blocks into an indirect block", "[realgeom][dirbig]") {
     auto disk = trg::build_real_geometry_image();
     ufs2_filesystem fs(disk, 0);
