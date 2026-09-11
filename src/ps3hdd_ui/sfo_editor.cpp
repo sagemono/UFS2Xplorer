@@ -32,28 +32,46 @@ quint16 idx_to_fmt(int idx) {
     return 0x0204;
 }
 
-struct bitdef { quint32 bit; const char* label; };
+struct bitdef { quint32 bit; const char* label; quint32 needs = 0; };
 
 const std::vector<bitdef> kResolution = {
     {0x01, "480 (4:3)"},  {0x02, "576 (4:3)"},   {0x04, "720 (16:9)"},
     {0x08, "1080 (16:9)"}, {0x10, "480 (16:9)"}, {0x20, "576 (16:9)"},
 };
 const std::vector<bitdef> kSoundFormat = {
-    {0x001, "LPCM 2.0"}, {0x004, "LPCM 5.1"}, {0x010, "LPCM 7.1"},
-    {0x100, "Dolby Digital 5.1"}, {0x200, "DTS 5.1"},
+    {0x001, "LPCM 2.0"},
+    {0x002, "Compressed audio enable"},
+    {0x004, "LPCM 5.1"},
+    {0x010, "LPCM 7.1"},
+    {0x100, "Dolby Digital 5.1", 0x002},
+    {0x200, "DTS 5.1", 0x002},
 };
 const std::vector<bitdef> kAttribute = {
-    {0x00000001, "PSP Remote Play (v1)"},   {0x00000002, "PSP Export"},
-    {0x00000004, "PSP Remote Play (v2)"},   {0x00000008, "In-game XMB: forced on"},
-    {0x00000010, "In-game XMB: disabled"},  {0x00000020, "In-game XMB: background music"},
-    {0x00000080, "PS Vita Remote Play"},    {0x00000100, "Move controller warning"},
-    {0x00000200, "Navigation controller warning"}, {0x00000400, "PlayStation Eye warning"},
-    {0x00000800, "Move calibration notice"}, {0x00001000, "Stereoscopic 3D warning"},
-    {0x00010000, "Install disc (hide disc icon)"}, {0x00020000, "Install packages"},
-    {0x00080000, "Game purchase enabled"},  {0x00100000, "In-game XMB (software, BOOTABLE=2)"},
-    {0x00200000, "PCEngine"},               {0x00400000, "License logo disabled"},
-    {0x00800000, "Move controller enabled"}, {0x04000000, "NeoGeo"},
+    {0x00000001, "PSP Remote Play (v1)"},
+    {0x00000002, "PSP Export"},
+    {0x00000004, "PSP Remote Play (v2)", 0x00000001},
+    {0x00000008, "In-game XMB: forced on"},
+    {0x00000010, "In-game XMB: disabled"},
+    {0x00000020, "In-game XMB: background music"},
+    {0x00000040, "System voice chat (unconfirmed)"},
+    {0x00000080, "PS Vita Remote Play"},
+    {0x00000100, "Move controller warning"},
+    {0x00000200, "Navigation controller warning", 0x00000100},
+    {0x00000400, "PlayStation Eye warning", 0x00000100},
+    {0x00000800, "Move calibration notice"},
+    {0x00001000, "Stereoscopic 3D warning"},
+    {0x00002000, "PlayStation Now beta notice"},
+    {0x00010000, "Install disc (hide disc icon)"},
+    {0x00020000, "Install packages"},
+    {0x00080000, "Game purchase enabled"},
+    {0x00100000, "License related (unconfirmed)"},
+    {0x00200000, "PCEngine"},
+    {0x00400000, "License logo disabled"},
+    {0x00800000, "Move controller enabled"},
+    {0x04000000, "NeoGeo", 0x00200000},
 };
+
+bool has_friendly_editor(const QString& key);
 
 const std::vector<bitdef>* bits_for(const QString& key) {
     const QString k = key.trimmed().toUpper();
@@ -61,6 +79,11 @@ const std::vector<bitdef>* bits_for(const QString& key) {
     if (k == QStringLiteral("SOUND_FORMAT")) return &kSoundFormat;
     if (k == QStringLiteral("ATTRIBUTE")) return &kAttribute;
     return nullptr;
+}
+
+bool has_friendly_editor(const QString& key) {
+    const QString k = key.trimmed().toUpper();
+    return bits_for(k) != nullptr || k == QStringLiteral("PARENTAL_LEVEL");
 }
 
 QString decode_summary(const QString& key, const QString& value) {
@@ -86,7 +109,10 @@ long long edit_bitfield(QWidget* parent, const QString& title, quint32 value, co
     QDialog dlg(parent);
     dlg.setWindowTitle(title);
     auto* lay = new QVBoxLayout(&dlg);
-    lay->addWidget(new QLabel(QStringLiteral("Tick the features to enable. Undocumented bits are kept via the raw value below.")));
+    auto* hint = new QLabel(QStringLiteral(
+        "Tick the features to enable. Flags marked \"needs\" are pulled in automatically, and clearing one clears anything that depended on it. Undocumented bits are preserved through the raw value below."));
+    hint->setWordWrap(true);
+    lay->addWidget(hint);
 
     auto* scroll = new QScrollArea();
     scroll->setWidgetResizable(true);
@@ -94,7 +120,12 @@ long long edit_bitfield(QWidget* parent, const QString& title, quint32 value, co
     auto* grid = new QGridLayout(holder);
     std::vector<QCheckBox*> boxes;
     for (std::size_t i = 0; i < defs.size(); ++i) {
-        auto* cb = new QCheckBox(QStringLiteral("%1  (0x%2)").arg(QLatin1String(defs[i].label)).arg(defs[i].bit, 0, 16));
+        QString label = QStringLiteral("%1  (0x%2)").arg(QLatin1String(defs[i].label)).arg(defs[i].bit, 0, 16);
+        if (defs[i].needs) {
+            for (const auto& n : defs)
+                if (n.bit == defs[i].needs) { label += QStringLiteral("  - needs %1").arg(QLatin1String(n.label)); break; }
+        }
+        auto* cb = new QCheckBox(label);
         boxes.push_back(cb);
         grid->addWidget(cb, static_cast<int>(i / 2), static_cast<int>(i % 2));
     }
@@ -118,7 +149,15 @@ long long edit_bitfield(QWidget* parent, const QString& title, quint32 value, co
     };
     for (std::size_t i = 0; i < defs.size(); ++i)
         QObject::connect(boxes[i], &QCheckBox::toggled, &dlg, [&, val, i](bool on) {
-            if (on) *val |= defs[i].bit; else *val &= ~defs[i].bit;
+            if (on) {
+                // ticking a dependent flag pulls its prerequisite in with it
+                *val |= defs[i].bit | defs[i].needs;
+            } else {
+                *val &= ~defs[i].bit;
+                // and clearing a prerequisite clears whatever depended on it
+                for (const auto& d : defs)
+                    if (d.needs & defs[i].bit) *val &= ~d.bit;
+            }
             refresh_from_val();
         });
     QObject::connect(hex, &QLineEdit::editingFinished, &dlg, [&, val, hex] {
@@ -163,11 +202,18 @@ sfo_editor::sfo_editor(std::vector<sfo_field> fields, const QString& subtitle, Q
         refresh_decoded(it->row());
     });
 
+    connect(table_, &QTableWidget::cellDoubleClicked, this, [this](int r, int c) {
+        if (c != 3 || !table_->item(r, 0)) return;
+        if (!has_friendly_editor(table_->item(r, 0)->text())) return;
+        table_->setCurrentCell(r, 2);
+        edit_field();
+    });
+
     auto* row = new QHBoxLayout();
     auto* add = new QPushButton(QStringLiteral("Add key"));
     auto* del = new QPushButton(QStringLiteral("Remove key"));
     auto* edit = new QPushButton(QStringLiteral("Edit field…"));
-    edit->setToolTip(QStringLiteral("Friendly editor for the selected RESOLUTION / SOUND_FORMAT / ATTRIBUTE / PARENTAL_LEVEL row (checkboxes / slider)."));
+    edit->setToolTip(QStringLiteral("Friendly editor for the selected RESOLUTION / SOUND_FORMAT / ATTRIBUTE / PARENTAL_LEVEL row (checkboxes / slider). Double-clicking the Decoded cell does the same."));
     auto* save = new QPushButton(QStringLiteral("Save"));
     auto* cancel = new QPushButton(QStringLiteral("Cancel"));
     row->addWidget(add);
@@ -206,7 +252,7 @@ void sfo_editor::append_row(const sfo_field& f) {
     auto* dec = new QTableWidgetItem(decode_summary(f.key, f.value));
     dec->setFlags(dec->flags() & ~Qt::ItemIsEditable);
     dec->setForeground(QColor(0x9a, 0x9a, 0x9a));
-    dec->setToolTip(dec->text());
+    dec->setToolTip(has_friendly_editor(f.key) ? QStringLiteral("%1\n\nDouble-click to edit this field with checkboxes.").arg(dec->text()) : dec->text());
     table_->setItem(r, 3, dec);
 }
 
@@ -215,7 +261,8 @@ void sfo_editor::refresh_decoded(int r) {
     const QString text = decode_summary(table_->item(r, 0)->text(), table_->item(r, 2)->text());
     QSignalBlocker block(table_); // dont reenter itemChanged
     table_->item(r, 3)->setText(text);
-    table_->item(r, 3)->setToolTip(text);
+    table_->item(r, 3)->setToolTip(
+        has_friendly_editor(table_->item(r, 0)->text()) ? QStringLiteral("%1\n\nDouble-click to edit this field with checkboxes.").arg(text) : text);
 }
 
 void sfo_editor::add_row() {
