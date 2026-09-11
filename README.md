@@ -6,6 +6,17 @@ Take the drive out of your PS3, open it on your computer, and browse it like a f
 
 There are already good command line readers for PS3 drives. UFS2Xplorer is aimed at people who want a proper graphical app that can also write, not just read.
 
+UFS2Xplorer is deliberately optimized to reach the absolute maximum read and write speed your drive of choice can deliver. This is motivated by the factor that installing packages through the XMB can take **hours** if not ***days***.
+
+![Package installation](./assets/install.png)
+
+> [!WARNING]
+> **UFS2Xplorer is early-stage software that reads and *writes* to the HDD.**
+> Incorrect writes can causee **permanent data loss.** The author is **not
+> responsible** for any damage, data loss, or other issues resulting from use of
+> this tool. Use entirely at your own risk, and **always dump your save files and
+> files you deem important. Keep multiple backups in a safe location before changing anything.**
+
 ## What it can do
 
 - Browse the whole drive in a tree view (copy, cut, paste, rename, extract, import)
@@ -41,10 +52,14 @@ Building from source is covered in [docs/BUILDING.md](docs/BUILDING.md).
 
 The PS3 curve parameters, keys, and key-derivation tables used for licensing are long-published public values. The cryptography here is built on OpenSSL; no third-party code is bundled for it.
 
+## Post 1.0.0 roadmap
+
+- Save data backups / decryption / extraction
+- 1:1 MMS database recreation to make package installation as seamless as possible, MMS is the database engine the XMB uses to register XMB icons, rebuilding the database manually mitigates the issue of packages not appearing on the XMB after using UFS2Xplorer. Reverse engineering of the engine has taken place but will take a substatial amount of timee due to Sony using a custom database engine rather than something standard like SQLite.
+
 ## Credits
 
-Reading a PS3 drive on a PC was worked out by the homebrew scene long before this app
-existed. UFS2Xplorer packages that knowledge into a GUI, it did not discover any of it.
+Reading a PS3 drive on a PC was worked out by the homebrew scene long before this app existed. UFS2Xplorer packages that knowledge into a GUI, it did not discover any of it. Years worth of RE work packaged into a convenient UI.
 
 - **[PS3HDDTool](https://github.com/Pheeeeenom/PS3HDDTool)** by Mena, for the base application C# code UFS2Xplorer was derrived from.
 - **[PS3 HDD Reader](https://github.com/jhonathanc/PS3-HDD-Reader)** by **3141card**, the original PC side reader, and the tool that established that an encrypted PS3 drive can be read on a PC given the console's `eid_root_key`.
